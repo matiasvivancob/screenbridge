@@ -44,11 +44,22 @@ final class Agent {
         a.sin_port = discoveryPort.bigEndian
         a.sin_addr.s_addr = INADDR_BROADCAST
         let msg = json(["type": "announce", "name": name, "port": Int(controlPort), "version": 1])
+        var failures = 0
         Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
-            _ = withUnsafePointer(to: &a) {
+            let sent = withUnsafePointer(to: &a) {
                 $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                     sendto(fd, msg, msg.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
                 }
+            }
+            if sent < 0 {
+                failures += 1
+                // Usually macOS Local Network privacy: the user hasn't allowed ScreenBridge yet.
+                if failures == 1 || failures % 30 == 0 {
+                    log("announce failed: \(String(cString: strerror(errno))) (errno \(errno), \(failures) failures)")
+                }
+            } else if failures > 0 {
+                log("announce working again after \(failures) failures")
+                failures = 0
             }
         }.fire()
     }
