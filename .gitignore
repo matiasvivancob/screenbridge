@@ -1,0 +1,5 @@
+/windows/target/
+/dist/
+/mac/build/
+*.log
+.DS_Store
