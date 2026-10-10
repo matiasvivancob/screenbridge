@@ -1,9 +1,6 @@
-// screenbridge sender: creates virtual displays and streams each one to a viewer on the PC.
-// Usage: screenbridge <pc-ip> <WxH@port> [<WxH@port> ...] [--mbps N]
-//   e.g. screenbridge 192.168.1.20 2560x1440@5001 1920x1080@5002
-// Ctrl+C removes the displays.
-//
-// Packet: [frame_id u32 BE][chunk_idx u16 BE][chunk_count u16 BE][flags u8: bit0=keyframe bit1=HEVC][Annex-B bytes]
+// One virtual display: creates it, captures it, encodes it and streams it to the PC over UDP.
+// Wire format: docs/PROTOCOL.md. Packet:
+// [frame_id u32 BE][chunk_idx u16 BE][chunk_count u16 BE][flags u8: bit0=keyframe bit1=HEVC][Annex-B bytes]
 // chunk_count 0 = UTF-8 status text for the viewer (encode time).
 // The viewer sends control messages back on the same socket (see Screen.handle).
 
@@ -15,10 +12,14 @@ import VideoToolbox
 let HDR = 9
 let CHUNK = 1200
 
+func log(_ s: String) { NSLog("%@", s) }
+
+/// UDP socket "connected" to one viewer port on the PC.
 final class Link {
     let fd: Int32
+    private var closed = false
 
-    init(host: String, port: UInt16) {
+    init?(host: String, port: UInt16) {
         fd = socket(AF_INET, SOCK_DGRAM, 0)
         var size: Int32 = 4 << 20
         setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, socklen_t(MemoryLayout<Int32>.size))
@@ -26,11 +27,14 @@ final class Link {
         a.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         a.sin_family = sa_family_t(AF_INET)
         a.sin_port = port.bigEndian
-        guard inet_pton(AF_INET, host, &a.sin_addr) == 1 else { fatalError("bad IP: \(host)") }
-        let r = withUnsafePointer(to: &a) {
+        let fd = self.fd
+        let ok = inet_pton(AF_INET, host, &a.sin_addr) == 1 && withUnsafePointer(to: &a) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        } == 0
+        if !ok {
+            Darwin.close(fd)
+            return nil
         }
-        precondition(r == 0, "connect failed")
     }
 
     func send(_ p: [UInt8]) {
@@ -40,12 +44,18 @@ final class Link {
         }
     }
 
-    /// Control messages from the viewer: "K" = keyframe, "B<mbps>" = bitrate.
+    func close() {
+        closed = true
+        shutdown(fd, SHUT_RDWR)
+        Darwin.close(fd) // wakes the receive thread, which then exits
+    }
+
+    /// Control messages from the viewer (see Screen.handle).
     func onMessage(_ f: @escaping (String) -> Void) {
         let fd = self.fd
         Thread.detachNewThread {
             var b = [UInt8](repeating: 0, count: 64)
-            while true {
+            while !self.closed {
                 let n = recv(fd, &b, b.count, 0)
                 if n > 0, let m = String(bytes: b[0..<n], encoding: .utf8) { f(m) }
                 else if n < 0 { usleep(100_000) } // ECONNREFUSED while the viewer isn't running
@@ -59,7 +69,7 @@ struct EncoderSettings: Equatable {
     var fps = 60
     var speed = false // PrioritizeEncodingSpeedOverQuality
     var mbps = 30
-    var lowLatencyRC = true // Apple's low-latency rate control; may encode slower on some chips
+    var lowLatencyRC = true // Apple's low-latency rate control
 }
 
 final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
@@ -69,6 +79,8 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
     let q: DispatchQueue
     var stream: SCStream?
     let cfg = SCStreamConfiguration()
+    /// Called on the main queue if capture fails or stops on its own.
+    var onError: ((String) -> Void)?
     // Only touched on q (or in init, before capture starts):
     var session: VTCompressionSession?
     var enc = EncoderSettings()
@@ -82,7 +94,8 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
     var statsSince = DispatchTime.now().uptimeNanoseconds
     let sendLock = NSLock()
 
-    init(index: Int, w: Int, h: Int, link: Link, mbps: Int) {
+    /// Must be called on the main thread (the display's dispatch queue).
+    init(index: Int, w: Int, h: Int, link: Link, settings: EncoderSettings) {
         self.index = index
         self.w = w
         self.h = h
@@ -90,7 +103,7 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
         q = DispatchQueue(label: "screen\(index)")
         let d = CGVirtualDisplayDescriptor()
         d.queue = DispatchQueue.main
-        d.name = "screenbridge \(index + 1)"
+        d.name = "ScreenBridge \(index + 1)"
         d.maxPixelsWide = UInt32(w)
         d.maxPixelsHigh = UInt32(h)
         d.sizeInMillimeters = CGSize(width: Double(w) / 110 * 25.4, height: Double(h) / 110 * 25.4)
@@ -99,7 +112,7 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
         d.productID = 0x1000 + UInt32(index)
         d.serialNum = UInt32(index + 1)
         display = CGVirtualDisplay(descriptor: d)
-        enc.mbps = mbps
+        enc = settings
         super.init()
         setMode(fps: enc.fps)
         makeSession()
@@ -110,7 +123,7 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
         let s = CGVirtualDisplaySettings()
         s.hiDPI = 0
         s.modes = [CGVirtualDisplayMode(width: UInt32(w), height: UInt32(h), refreshRate: CGFloat(fps))]
-        if !display.apply(s) { print("display \(index + 1): \(fps) Hz mode rejected") }
+        if !display.apply(s) { log("display \(index + 1): \(fps) Hz mode rejected") }
     }
 
     /// (Re)creates the encoder from `enc`.
@@ -128,11 +141,11 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         var st = create()
         if st != noErr && enc.lowLatencyRC {
-            print("display \(index + 1): low-latency rate control unavailable (\(st)), using normal rate control")
+            log("display \(index + 1): low-latency rate control unavailable (\(st)), using normal rate control")
             spec.removeValue(forKey: kVTVideoEncoderSpecification_EnableLowLatencyRateControl as String)
             st = create()
         }
-        guard st == noErr, let s = session else { print("display \(index + 1): encoder failed (\(st))"); return }
+        guard st == noErr, let s = session else { log("display \(index + 1): encoder failed (\(st))"); return }
         var props: [CFString: CFTypeRef] = [
             kVTCompressionPropertyKey_RealTime: kCFBooleanTrue,
             kVTCompressionPropertyKey_ProfileLevel: enc.hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_ConstrainedHigh_AutoLevel,
@@ -143,12 +156,12 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
         if enc.speed { props[kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality] = kCFBooleanTrue }
         for (k, v) in props {
             let r = VTSessionSetProperty(s, key: k, value: v)
-            if r != noErr { print("display \(index + 1): \(k) rejected (\(r))") }
+            if r != noErr { log("display \(index + 1): \(k) rejected (\(r))") }
         }
         VTCompressionSessionPrepareToEncodeFrames(s)
         forceKey = true
         pts = 0
-        print("display \(index + 1): \(enc.hevc ? "HEVC" : "H.264"), \(enc.fps) fps, \(enc.mbps) Mbps\(enc.speed ? ", speed priority" : "")\(enc.lowLatencyRC ? "" : ", standard rate control")")
+        log("display \(index + 1): \(enc.hevc ? "HEVC" : "H.264"), \(enc.fps) fps, \(enc.mbps) Mbps\(enc.speed ? ", speed priority" : "")\(enc.lowLatencyRC ? "" : ", standard rate control")")
     }
 
     /// Control messages from the viewer: "K", "B<mbps>", "C264"/"C265", "F60"/"F120", "S0"/"S1", "L0"/"L1".
@@ -171,11 +184,11 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
             if e.fps != old.fps {
                 DispatchQueue.main.sync { self.setMode(fps: e.fps) }
                 self.cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(e.fps))
-                self.stream?.updateConfiguration(self.cfg) { err in if let err { print("frame rate change: \(err)") } }
+                self.stream?.updateConfiguration(self.cfg) { err in if let err { log("frame rate change: \(err)") } }
             }
             if (e.hevc, e.fps, e.speed, e.lowLatencyRC) == (old.hevc, old.fps, old.speed, old.lowLatencyRC), let s = self.session {
                 VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: e.mbps * 1_000_000))
-                print("display \(self.index + 1): bitrate \(e.mbps) Mbps")
+                log("display \(self.index + 1): bitrate \(e.mbps) Mbps")
             } else {
                 self.makeSession()
                 if let pb = self.last { self.encode(pb) } // show the change even on a static screen
@@ -186,8 +199,8 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
     func start() {
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { content, err in
             if let err {
-                print("ScreenCaptureKit: \(err)\nGrant Screen Recording to your terminal app (System Settings > Privacy & Security).")
-                exit(1)
+                DispatchQueue.main.async { self.onError?("Screen capture unavailable: \(err.localizedDescription)") }
+                return
             }
             guard let scd = content?.displays.first(where: { $0.displayID == self.display.displayID }) else {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.start() } // display not visible yet
@@ -201,12 +214,29 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
             cfg.showsCursor = true
             cfg.queueDepth = 6 // we keep one surface as `last`, the encoder holds a few
             let st = SCStream(filter: SCContentFilter(display: scd, excludingWindows: []), configuration: cfg, delegate: self)
-            do { try st.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.q) } catch { fatalError("\(error)") }
+            do {
+                try st.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.q)
+            } catch {
+                DispatchQueue.main.async { self.onError?("Capture setup failed: \(error.localizedDescription)") }
+                return
+            }
             st.startCapture { e in
-                if let e { print("capture failed: \(e)"); exit(1) }
+                if let e { DispatchQueue.main.async { self.onError?("Capture failed: \(e.localizedDescription)") } }
             }
             self.stream = st
-            print("display \(self.index + 1) (id \(self.display.displayID)): \(self.w)x\(self.h) streaming")
+            log("display \(self.index + 1) (id \(self.display.displayID)): \(self.w)x\(self.h) streaming")
+        }
+    }
+
+    /// Stops streaming. The virtual display disappears when this object is released.
+    func stop() {
+        stream?.stopCapture { _ in }
+        stream = nil
+        link.close()
+        q.sync {
+            if let s = session { VTCompressionSessionInvalidate(s) }
+            session = nil
+            last = nil
         }
     }
 
@@ -220,8 +250,7 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        print("capture stopped: \(error)")
-        exit(1)
+        DispatchQueue.main.async { self.onError?("Capture stopped: \(error.localizedDescription)") }
     }
 
     func encode(_ pb: CVPixelBuffer) {
@@ -313,24 +342,3 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 }
-
-var args = Array(CommandLine.arguments.dropFirst())
-var mbps = 30
-if let i = args.firstIndex(of: "--mbps"), i + 1 < args.count, let v = Int(args[i + 1]) {
-    mbps = v
-    args.removeSubrange(i...i + 1)
-}
-guard args.count >= 2 else {
-    print("usage: screenbridge <pc-ip> <WxH@port> [<WxH@port> ...] [--mbps N]\n  e.g. screenbridge 192.168.1.20 2560x1440@5001 1920x1080@5002")
-    exit(1)
-}
-var screens: [Screen] = []
-for (i, spec) in args.dropFirst().enumerated() {
-    let parts = spec.split(whereSeparator: { $0 == "x" || $0 == "@" }).compactMap { Int($0) }
-    guard parts.count == 3 else { print("bad display spec: \(spec)  (expected WxH@port)"); exit(1) }
-    let s = Screen(index: i, w: parts[0], h: parts[1], link: Link(host: args[0], port: UInt16(parts[2])), mbps: mbps)
-    screens.append(s)
-    s.start()
-}
-print("Arrange the new displays in System Settings > Displays. Ctrl+C to remove them.")
-RunLoop.main.run()
