@@ -1,20 +1,6 @@
 # Changelog
 
-## 0.1.0
-
-First packaged release.
-
-- Mac menu-bar app (`ScreenBridge.app`, universal, ad-hoc signed) and Windows tray app with installer.
-- Automatic discovery of Macs on the LAN; one-time approval of a PC on the Mac.
-- Configurable displays: count, size, monitor mapping, codec, bitrate, frame rate (Settings window).
-- View-only fullscreen viewers with F11, F10 live menu and live statistics in the title bar.
-- Hardware decode and Direct3D 11 presentation on the PC.
-- Build, release and installer test scripts.
-- Portable builds: `ScreenBridge-<version>-portable.zip` (Windows, settings in a `data` folder beside the exe) and
-  `ScreenBridge-<version>-mac.zip`.
-- The Windows exe links the C runtime statically, so it runs on a clean Windows without the Visual C++ Redistributable.
-
-## Unreleased
+## 0.2.0 (2026-10-11)
 
 - Optional cursor overlay (on by default on Windows): draw the Mac pointer over the latest video frame for lower pointer lag, switchable per viewer with F10.
 - **AV1 and VP9** (software encode on the Mac with SVT-AV1 / libvpx, hardware decode on the PC), switchable live from the
@@ -27,5 +13,19 @@ First packaged release.
   stall recovery, GPU reset recovery, no lost bytes on TCP read timeouts, pong deadline, no eviction of the active PC
   before approval, revoke disconnects, handshake timeout, tray recovery after Explorer restarts.
 - Installer only stops its own copy; release script refuses stale artifacts; tests fail loudly.
+
+## 0.1.0
+
+First packaged build (internal; never published).
+
+- Mac menu-bar app (`ScreenBridge.app`, universal, ad-hoc signed) and Windows tray app with installer.
+- Automatic discovery of Macs on the LAN; one-time approval of a PC on the Mac.
+- Configurable displays: count, size, monitor mapping, codec, bitrate, frame rate (Settings window).
+- View-only fullscreen viewers with F11, F10 live menu and live statistics in the title bar.
+- Hardware decode and Direct3D 11 presentation on the PC.
+- Build, release and installer test scripts.
+- Portable builds: `ScreenBridge-<version>-portable.zip` (Windows, settings in a `data` folder beside the exe) and
+  `ScreenBridge-<version>-mac.zip`.
+- The Windows exe links the C runtime statically, so it runs on a clean Windows without the Visual C++ Redistributable.
 
 Earlier prototype work (command-line sender and viewer) is in the git history.

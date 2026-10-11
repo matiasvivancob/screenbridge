@@ -27,6 +27,10 @@ $unins = Get-ChildItem $dir -Filter 'unins*.exe' | Select-Object -First 1
 Check "uninstaller present" ($null -ne $unins)
 
 # Start the tray from the installed copy, check it stays up and holds the single-instance mutex.
+# Isolated: portable.txt gives it its own settings folder and instance lock (so it can never use the real PC
+# identity or collide with a copy the user is running), and discovery is off so it can never reach a real Mac.
+Set-Content (Join-Path $dir 'portable.txt') 'test'
+$env:SB_DISABLE_DISCOVERY = '1'
 $tray = Start-Process -FilePath $exe -PassThru
 Start-Sleep 3
 Check "tray runs" (-not $tray.HasExited)
@@ -42,5 +46,6 @@ Check "running tray stopped by uninstall" (-not (Get-Process -Id $tray.Id -Error
 $run2 = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name ScreenBridge -ErrorAction SilentlyContinue).ScreenBridge
 Check "autostart entry removed" (-not $run2)
 if ($savedRun) { Set-ItemProperty $runKey -Name ScreenBridge -Value $savedRun }
+Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host $(if ($script:failed) { "$script:failed FAILED" } else { "ALL PASSED" })
 exit $script:failed
