@@ -1,7 +1,7 @@
 // One virtual display: creates it, captures it, encodes it and streams it to the PC over UDP.
 // Wire format: docs/PROTOCOL.md. Packet:
 // [frame_id u32 BE][chunk_idx u16 BE][chunk_count u16 BE][flags u8: bit0=keyframe bit1=HEVC][Annex-B bytes]
-// chunk_count 0 = UTF-8 status text for the viewer (encode time).
+// chunk_count 0 = typed side-channel packet (status text or cursor state).
 // The viewer sends control messages back on the same socket (see Screen.handle).
 
 import CoreMedia
@@ -43,7 +43,14 @@ final class Link {
         }
     }
 
-    func send(_ p: [UInt8]) {
+    func send(_ p: [UInt8], nonblocking: Bool = false) {
+        if nonblocking {
+            // Cursor updates must not wait behind a video burst or retry a full socket buffer.
+            guard lock.try() else { return }
+            defer { lock.unlock() }
+            if !closed { _ = Darwin.send(fd, p, p.count, MSG_DONTWAIT) }
+            return
+        }
         for _ in 0..<200 {
             lock.lock()
             if closed { lock.unlock(); return }
@@ -117,8 +124,11 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
     let cfg = SCStreamConfiguration()
     /// Called on the main queue if capture fails or stops on its own.
     var onError: ((String) -> Void)?
+    /// Called on the main queue when the viewer changes cursor overlay mode.
+    var onCursorOverlayChange: (() -> Void)?
     private let stateLock = NSLock()
     private var stopped = false // guarded by stateLock: stop() cancels any startup still in flight
+    private var cursorOverlay = false // guarded by stateLock
     private var encodeFailures = 0
     private var encoderReady = false
     // Only touched on q (or in init, before capture starts):
@@ -235,7 +245,7 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
         return prep == noErr
     }
 
-    /// Control messages from the viewer: "K", "B<mbps>", "C264"/"C265"/"CAV1"/"CVP9", "F60"/"F120", "S0"/"S1", "L0"/"L1".
+    /// Control messages from the viewer: "K", "B<mbps>", "C264"/"C265"/"CAV1"/"CVP9", "F60"/"F120", "S0"/"S1", "L0"/"L1", "P0"/"P1".
     func handle(_ m: String) {
         if m == "K" { return requestKey() }
         q.async {
@@ -253,6 +263,20 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
             case "F": if let v, v == 60 || v == 120 { e.fps = v }
             case "S": e.speed = m == "S1"
             case "L": e.lowLatencyRC = m == "L1"
+            case "P":
+                guard m == "P0" || m == "P1" else { return }
+                let overlay = m == "P1"
+                self.stateLock.lock()
+                guard !self.stopped, self.cursorOverlay != overlay else { self.stateLock.unlock(); return }
+                self.cursorOverlay = overlay
+                let st = self.stream
+                // Submit under the same lock as stop(), so a late P1 cannot re-register a stopped screen.
+                if overlay { CursorFeed.shared.register(self) } else { CursorFeed.shared.unregister(self) }
+                self.stateLock.unlock()
+                self.cfg.showsCursor = !overlay
+                st?.updateConfiguration(self.cfg) { err in if let err { log("cursor overlay change: \(err)") } }
+                DispatchQueue.main.async { self.onCursorOverlayChange?() }
+                return
             default: return
             }
             let old = self.enc
@@ -284,6 +308,12 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
         return stopped
     }
 
+    var hasCursorOverlay: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return cursorOverlay && !stopped
+    }
+
     func start() {
         guard encoderReady else {
             DispatchQueue.main.async { self.onError?("The Mac's hardware video encoder couldn't start for this display.") }
@@ -299,30 +329,34 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { if !self.isStopped { self.start() } } // not visible yet
                 return
             }
-            let cfg = self.cfg
-            cfg.width = self.w
-            cfg.height = self.h
-            cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(self.enc.fps))
-            cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-            cfg.showsCursor = true
-            cfg.queueDepth = 6 // we keep one surface as `last`, the encoder holds a few
-            let st = SCStream(filter: SCContentFilter(display: scd, excludingWindows: []), configuration: cfg, delegate: self)
-            do {
-                try st.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.q)
-            } catch {
-                DispatchQueue.main.async { self.onError?("Capture setup failed: \(error.localizedDescription)") }
-                return
+            // Configuration and back-channel changes share q, including P1 arriving before capture starts.
+            self.q.async {
+                if self.isStopped { return }
+                let cfg = self.cfg
+                cfg.width = self.w
+                cfg.height = self.h
+                cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(self.enc.fps))
+                cfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                cfg.showsCursor = !self.hasCursorOverlay
+                cfg.queueDepth = 6 // we keep one surface as `last`, the encoder holds a few
+                let st = SCStream(filter: SCContentFilter(display: scd, excludingWindows: []), configuration: cfg, delegate: self)
+                do {
+                    try st.addStreamOutput(self, type: .screen, sampleHandlerQueue: self.q)
+                } catch {
+                    DispatchQueue.main.async { self.onError?("Capture setup failed: \(error.localizedDescription)") }
+                    return
+                }
+                self.stateLock.lock()
+                let cancelled = self.stopped
+                if !cancelled { self.stream = st }
+                self.stateLock.unlock()
+                if cancelled { return }
+                st.startCapture { e in
+                    if let e { DispatchQueue.main.async { self.onError?("Capture failed: \(e.localizedDescription)") } }
+                    if self.isStopped { st.stopCapture { _ in } } // stop() raced with startup
+                }
+                log("display \(self.index + 1) (id \(self.display.displayID)): \(self.w)x\(self.h) streaming")
             }
-            self.stateLock.lock()
-            let cancelled = self.stopped
-            if !cancelled { self.stream = st }
-            self.stateLock.unlock()
-            if cancelled { return }
-            st.startCapture { e in
-                if let e { DispatchQueue.main.async { self.onError?("Capture failed: \(e.localizedDescription)") } }
-                if self.isStopped { st.stopCapture { _ in } } // stop() raced with startup
-            }
-            log("display \(self.index + 1) (id \(self.display.displayID)): \(self.w)x\(self.h) streaming")
         }
     }
 
@@ -330,6 +364,8 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
     func stop() {
         stateLock.lock()
         stopped = true
+        cursorOverlay = false
+        CursorFeed.shared.unregister(self)
         let st = stream
         stream = nil
         stateLock.unlock()
@@ -498,13 +534,13 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         frameID &+= 1
 
-        // Once a second, tell the viewer how long encoding takes (chunk_count 0 = text message).
+        // Once a second, tell the viewer how long encoding takes (side-channel kind 0x01).
         encodeMs.append(Double(encodeNs) / 1e6)
         let now = DispatchTime.now().uptimeNanoseconds
         if now - statsSince >= 1_000_000_000 {
             encodeMs.sort()
             let text = String(format: "Mac encode %.1f ms (max %.1f)", encodeMs[encodeMs.count / 2], encodeMs.last!)
-            link.send([UInt8](repeating: 0, count: HDR) + Array(text.utf8))
+            link.send([UInt8](repeating: 0, count: HDR) + [0x01] + Array(text.utf8))
             encodeMs.removeAll(keepingCapacity: true)
             statsSince = now
         }

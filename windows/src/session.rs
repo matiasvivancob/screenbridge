@@ -4,6 +4,7 @@
 //! turned on and off independently; turning one on opens its viewer here and asks the Mac to create the display.
 
 use crate::config::{self, Config, DiscoveredMac};
+use crate::cursor::{self, CursorStore};
 use crate::viewer;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -101,6 +102,7 @@ enum Outcome {
 
 /// The link thread. `notify` is called after every state change.
 pub fn run(macs: Macs, cmds: Receiver<Command>, state: Shared, notify: impl Fn()) {
+    let cursors = Arc::new(CursorStore::default());
     let mut connect = Config::load().auto_connect;
     // Displays the user had on, restored after a reconnect (Mac woke from sleep, network blip).
     let mut remembered: HashSet<usize> = HashSet::new();
@@ -115,7 +117,7 @@ pub fn run(macs: Macs, cmds: Receiver<Command>, state: Shared, notify: impl Fn()
             continue;
         }
         set(&state, &notify, Status::Searching, false);
-        match link_once(&macs, &cmds, &state, &notify, &mut remembered) {
+        match link_once(&macs, &cmds, &state, &notify, &mut remembered, &cursors) {
             Outcome::Quit => return,
             Outcome::Disconnected | Outcome::Denied => connect = false,
             Outcome::Lost(reason) => {
@@ -159,7 +161,7 @@ fn modified(path: &std::path::Path) -> Option<SystemTime> {
 }
 
 /// One connection to the Mac, from connect to disconnect.
-fn link_once(macs: &Macs, cmds: &Receiver<Command>, state: &Shared, notify: &impl Fn(), remembered: &mut HashSet<usize>) -> Outcome {
+fn link_once(macs: &Macs, cmds: &Receiver<Command>, state: &Shared, notify: &impl Fn(), remembered: &mut HashSet<usize>, cursors: &Arc<CursorStore>) -> Outcome {
     let mut cfg = Config::load();
     let cfg_path = config::dir().join("config.json");
     let mut cfg_mtime = modified(&cfg_path);
@@ -302,7 +304,9 @@ fn link_once(macs: &Macs, cmds: &Receiver<Command>, state: &Shared, notify: &imp
                 fps120: cfg.fps == 120,
                 speed: cfg.speed,
                 low_latency_rc: cfg.low_latency_rc,
+                cursor_overlay: cfg.cursor_overlay,
             },
+            cursors: cursors.clone(),
         };
         // A viewer closed a moment ago may still hold the port; give it a second to let go.
         let mut opened = None;
@@ -458,6 +462,11 @@ fn link_once(macs: &Macs, cmds: &Receiver<Command>, state: &Shared, notify: &imp
                 }
                 Some("error") => {
                     balloon(state, notify, "ScreenBridge couldn't turn a display on", v["message"].as_str().unwrap_or("Error on the Mac"));
+                }
+                Some("cursor_shape") => {
+                    if let Some((id, image)) = cursor::decode_shape(&v) {
+                        cursors.insert(id, image);
+                    }
                 }
                 Some("state") => {
                     // The Mac says which displays exist. A viewer whose display the Mac doesn't have (capture failed,

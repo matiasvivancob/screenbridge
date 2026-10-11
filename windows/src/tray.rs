@@ -33,8 +33,15 @@ static APP: Mutex<Option<App>> = Mutex::new(None);
 
 pub fn run() {
     unsafe {
-        // One tray icon per user: a second launch (e.g. autostart + manual) just exits.
-        let _guard = CreateMutexW(None, true, w!("Local\\ScreenBridgeTray"));
+        // One tray icon per settings folder: a second launch (e.g. autostart + manual) just exits, while a portable
+        // copy with its own data folder can run next to an installed one.
+        let name = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new(); // fixed keys: same value in every process
+            crate::config::dir().to_string_lossy().to_lowercase().hash(&mut h);
+            HSTRING::from(format!("Local\\ScreenBridgeTray-{:016x}", h.finish()))
+        };
+        let _guard = CreateMutexW(None, true, &name);
         if GetLastError() == ERROR_ALREADY_EXISTS {
             return;
         }

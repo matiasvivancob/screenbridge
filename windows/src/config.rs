@@ -27,6 +27,7 @@ pub struct Config {
     pub fps: u32,
     pub speed: bool,
     pub low_latency_rc: bool,
+    pub cursor_overlay: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -110,6 +111,7 @@ impl Default for Config {
             fps: 60,
             speed: false,
             low_latency_rc: true,
+            cursor_overlay: true,
         }
     }
 }
@@ -224,4 +226,17 @@ fn random_id() -> String {
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
     h.write_u64(a);
     format!("{:016x}{:016x}", a, h.finish())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_overlay_defaults_on_in_existing_configs() {
+        let old: Config = serde_json::from_str("{}").unwrap();
+        assert!(old.cursor_overlay);
+        let off: Config = serde_json::from_str(r#"{"cursor_overlay":false}"#).unwrap();
+        assert!(!off.cursor_overlay);
+    }
 }

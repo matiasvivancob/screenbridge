@@ -3,6 +3,9 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $version = (Get-Content "$root\VERSION" -Raw).Trim()
+# CARGO_TARGET_DIR (honoured by cargo itself) lets a build go somewhere else while a copy in windows\target is running.
+$target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "$root\windows\target" }
+$exe = "$target\release\screenbridge.exe"
 
 Write-Host "Building ScreenBridge $version (Windows app)..."
 Push-Location "$root\windows"
@@ -16,7 +19,7 @@ $iscc = @(
 if (-not $iscc) { throw "Inno Setup 6 not found. Install it with: winget install JRSoftware.InnoSetup" }
 
 Write-Host "Building the installer..."
-& $iscc "/DAppVersion=$version" "$root\installer\ScreenBridge.iss"
+& $iscc "/DAppVersion=$version" "/DSourceExe=$exe" "$root\installer\ScreenBridge.iss"
 if ($LASTEXITCODE) { throw "Inno Setup failed" }
 Write-Host "Built dist\ScreenBridge-Setup-$version.exe"
 
@@ -24,7 +27,7 @@ Write-Host "Built dist\ScreenBridge-Setup-$version.exe"
 $stage = "$root\dist\portable-stage\ScreenBridge"
 Remove-Item "$root\dist\portable-stage" -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory $stage | Out-Null
-Copy-Item "$root\windows\target\release\screenbridge.exe" $stage
+Copy-Item $exe $stage
 Copy-Item "$root\README.md" $stage
 Set-Content "$stage\portable.txt" "ScreenBridge portable mode: settings are kept in the data folder next to screenbridge.exe.`r`nDelete this file to use %APPDATA%\ScreenBridge instead."
 $zip = "$root\dist\ScreenBridge-$version-portable.zip"

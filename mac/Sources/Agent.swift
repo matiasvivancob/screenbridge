@@ -24,6 +24,22 @@ final class Agent {
 
     let name = Host.current().localizedName ?? "Mac"
     private var session: Session?
+    private var cursorShape: CursorShape?
+    private lazy var cursorWatcher = CursorShapeWatcher { [weak self] shape in
+        guard let self else { return }
+        self.cursorShape = shape
+        self.session?.send(shape.message)
+    }
+
+    fileprivate func sendCursorShape(to s: Session) {
+        if let shape = cursorWatcher.sample() { cursorShape = shape }
+        if let shape = cursorShape { s.send(shape.message) }
+    }
+
+    fileprivate func updateCursorWatcher() {
+        let running = session.map { s in !s.ended && s.screens.values.contains { $0.hasCursorOverlay } } ?? false
+        cursorWatcher.setRunning(running)
+    }
 
     func start() {
         broadcast()
@@ -129,11 +145,13 @@ final class Agent {
     fileprivate func activate(_ s: Session) {
         if let old = session, old !== s { old.end(reason: "Another PC connected", tellPC: false) }
         session = s
+        updateCursorWatcher()
     }
 
     fileprivate func ended(_ s: Session, reason: String) {
         if session === s {
             session = nil
+            updateCursorWatcher()
             onStatus?(reason, false)
         }
     }
@@ -250,6 +268,7 @@ final class Session {
         welcomed = true
         agent.activate(self)
         send(["type": "welcome", "name": agent.name])
+        agent.sendCursorShape(to: self)
         status()
         watchdog = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             guard let self else { return }
@@ -288,6 +307,7 @@ final class Session {
         if let old = screens.removeValue(forKey: id) { old.stop() }
         // The slot number is the display's identity (vendor/product/serial), so macOS remembers its arrangement.
         let s = Screen(index: id, w: w & ~1, h: h & ~1, link: link, settings: enc)
+        s.onCursorOverlayChange = { [weak self] in self?.agent.updateCursorWatcher() }
         s.onError = { [weak self] msg in
             guard let self, self.screens[id] === s else { return }
             self.screens.removeValue(forKey: id)?.stop()
@@ -301,6 +321,7 @@ final class Session {
 
     /// Tells the PC which displays are on and refreshes the Mac's status.
     func changed() {
+        agent.updateCursorWatcher()
         send(["type": "state", "on": screens.keys.sorted()])
         status()
     }

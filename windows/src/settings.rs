@@ -384,6 +384,13 @@ impl eframe::App for Settings {
                 .on_hover_text(
                     "Ask the Mac encoder to minimize buffering while controlling the bitrate.",
                 );
+                ui.checkbox(
+                    &mut self.config.cursor_overlay,
+                    "Draw the cursor on the PC (lowest pointer lag)",
+                )
+                .on_hover_text(
+                    "Draw the Mac pointer over the latest picture without waiting for a new video frame.",
+                );
                 ui.label(
                     egui::RichText::new(
                         "These are the starting values; change them live with F10 in a viewer.",

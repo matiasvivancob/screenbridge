@@ -54,6 +54,12 @@ Decisions worth knowing:
 
 Decisions worth knowing:
 
+- **The pointer travels separately** (optional, on by default). The Mac leaves it out of the captured video and a
+  4 ms timer reads its position (`CGEvent(source: nil)`, no permission needed); a 50 ms watcher renders the system cursor
+  (`NSCursor.currentSystem`) to premultiplied BGRA and sends it over TCP only when it changes. The viewer draws the sprite
+  over the latest decoded picture with a tiny D3D11 pipeline, so the pointer moves at the monitor's refresh rate with
+  none of the capture/encode/decode delay. Position, hotspot and shape orientation were checked on real hardware
+  (`tools/cursor_probe.swift`). Windows, text and anything that reacts to the pointer still go through the video path.
 - **GPU all the way.** The decoder outputs D3D11 textures; the video processor converts and scales them straight into the
   swapchain's back buffer. The CPU only touches compressed bytes.
 - **The device is created on the adapter that drives the monitor**, so frames never cross GPUs.

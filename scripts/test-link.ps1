@@ -2,7 +2,8 @@
 # Checks connect, per-display toggles, reconnect with restored displays, and "Mac said bye".
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
-$exe = "$root\windows\target\release\screenbridge.exe"
+$target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "$root\windows\target" }
+$exe = "$target\release\screenbridge.exe"
 if (-not (Test-Path $exe)) { throw "Build first: cd windows; cargo build --release" }
 
 $dir = Join-Path $env:TEMP 'sb-link-test'

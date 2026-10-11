@@ -29,10 +29,14 @@ The icon shows two displays while any display is on.
 | Key / action | Result |
 |---|---|
 | **F11** | Fullscreen ↔ window |
-| **F10** or right-click | Settings menu, applied live: bitrate, codec, frame rate, encoder priority, rate control, refresh picture, close |
+| **F10** or right-click | Settings menu, applied live: bitrate, codec, frame rate, encoder priority, rate control, cursor overlay, refresh picture, close |
 | **Alt+F4** | Close this viewer. That display turns off; the link to the Mac stays up. |
 
 Viewers are ordinary windows (not always on top). Mouse and keyboard input in them is ignored.
+
+**Draw the cursor on the PC (lower pointer lag)** is on by default. The Mac sends pointer position and shape separately
+from the video, and the PC draws the pointer over the latest picture without waiting for another video frame. Toggle
+it per viewer with F10; turning it off returns to the pointer captured in the Mac's video. This does not send mouse input.
 
 The title bar shows live numbers, for example `60 fps · Mac encode 12.8 ms (max 19.8) · decode 0.3 ms · present 0.8 ms · 31.2 Mbps · H.264`.
 `N lost` means that many frames were damaged and the stream re-synced.
@@ -49,9 +53,10 @@ The title bar shows live numbers, for example `60 fps · Mac encode 12.8 ms (max
 | **Frame rate** | 60 is right for most monitors. 120 halves the capture wait and looks smoother on a 120/144 Hz monitor, at more GPU cost on the Mac. |
 | **Prioritize encoding speed** | Trades some quality for lower encode time. |
 | **Apple low-latency rate control** | Leave on unless a particular Mac encodes slowly with it. |
+| **Draw the cursor on the PC (lowest pointer lag)** | On by default. Draw the Mac pointer separately from video for lower pointer lag; the starting value for each viewer. |
 
 Saved settings are picked up within a couple of seconds: a display that is on is rebuilt if its size or monitor changed;
-codec, bitrate and frame rate apply to the next display you turn on. The F10 menu changes a running display immediately but isn't saved.
+stream settings, including cursor overlay, apply to the next display you turn on. The F10 menu changes a running display immediately but isn't saved.
 
 ## Sharing the mouse and keyboard
 

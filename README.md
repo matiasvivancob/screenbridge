@@ -35,6 +35,9 @@ Step by step, including the first-run approvals on both machines: [docs/INSTALL.
 The Mac's new displays appear on the PC's monitors. Arrange them in macOS System Settings → Displays.
 Turn a display off from either menu and the Mac removes it. The link itself costs about 2.5 MB of memory and no GPU.
 
+The pointer is drawn on the PC from separate position messages (on by default; F10 or Settings turns it off), so it
+moves with almost no lag even though the picture is a few frames behind.
+
 In each viewer window: **F11** fullscreen/window, **F10** or right-click for the live settings menu
 (bitrate, codec, frame rate...), **Alt+F4** close. Window title shows live fps, latency and bitrate.
 

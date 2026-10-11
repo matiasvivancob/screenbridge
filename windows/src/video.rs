@@ -1,9 +1,13 @@
 //! Hardware decode (Media Foundation, D3D11-backed) and presentation (D3D11 video processor -> flip-model swapchain).
 //! Decoded frames never leave the GPU.
 
+use crate::cursor::CursorImage;
+use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
+use std::sync::Arc;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct3D::*;
+use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
@@ -154,6 +158,164 @@ pub struct Gpu {
     tearing: bool,
     size: (u32, u32),
     vp: Option<(ID3D11VideoProcessorEnumerator, ID3D11VideoProcessor, [u32; 4])>,
+    cursor_code: (ID3DBlob, ID3DBlob),
+    cursor_draw: Option<CursorDraw>,
+}
+
+pub struct Cursor<'a> {
+    pub image: &'a Arc<CursorImage>,
+    pub shape: u16,
+    pub x: i16,
+    pub y: i16,
+}
+
+const CURSOR_SHADER: &str = r#"
+cbuffer Rect : register(b0) { float4 rect; };
+struct Vertex { float4 position : SV_Position; float2 uv : TEXCOORD0; };
+Vertex vs(uint id : SV_VertexID) {
+    Vertex v;
+    v.uv = float2(id & 1, id >> 1);
+    v.position = float4(rect.xy + v.uv * rect.zw, 0, 1);
+    return v;
+}
+Texture2D sprite : register(t0);
+SamplerState pointSampler : register(s0);
+float4 ps(Vertex v) : SV_Target { return sprite.Sample(pointSampler, v.uv); }
+"#;
+
+fn cursor_shader(entry: PCSTR, target: PCSTR) -> Result<ID3DBlob> {
+    unsafe {
+        let mut code = None;
+        D3DCompile(CURSOR_SHADER.as_ptr() as _, CURSOR_SHADER.len(), None, None, None, entry, target, 0, 0, &mut code, None)?;
+        code.ok_or_else(|| Error::new(E_FAIL, "no cursor shader bytecode"))
+    }
+}
+
+struct CursorDraw {
+    ctx: ID3D11DeviceContext,
+    vs: ID3D11VertexShader,
+    ps: ID3D11PixelShader,
+    rect: ID3D11Buffer,
+    sampler: ID3D11SamplerState,
+    blend: ID3D11BlendState,
+    raster: ID3D11RasterizerState,
+    depth: ID3D11DepthStencilState,
+    textures: VecDeque<(u16, Arc<CursorImage>, ID3D11ShaderResourceView)>,
+}
+
+impl CursorDraw {
+    fn new(device: &ID3D11Device, code: &(ID3DBlob, ID3DBlob)) -> Result<Self> {
+        unsafe {
+            let bytes = |b: &ID3DBlob| std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize());
+            let (mut vs, mut ps) = (None, None);
+            device.CreateVertexShader(bytes(&code.0), None, Some(&mut vs))?;
+            device.CreatePixelShader(bytes(&code.1), None, Some(&mut ps))?;
+            let mut rect = None;
+            let desc = D3D11_BUFFER_DESC { ByteWidth: 16, Usage: D3D11_USAGE_DEFAULT, BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32, ..Default::default() };
+            device.CreateBuffer(&desc, None, Some(&mut rect))?;
+            let mut sampler = None;
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_NEVER,
+                MaxLOD: f32::MAX,
+                ..Default::default()
+            };
+            device.CreateSamplerState(&desc, Some(&mut sampler))?;
+            let mut blend = None;
+            let mut desc = D3D11_BLEND_DESC::default();
+            desc.RenderTarget[0] = D3D11_RENDER_TARGET_BLEND_DESC {
+                BlendEnable: true.into(),
+                SrcBlend: D3D11_BLEND_ONE,
+                DestBlend: D3D11_BLEND_INV_SRC_ALPHA,
+                BlendOp: D3D11_BLEND_OP_ADD,
+                SrcBlendAlpha: D3D11_BLEND_ONE,
+                DestBlendAlpha: D3D11_BLEND_INV_SRC_ALPHA,
+                BlendOpAlpha: D3D11_BLEND_OP_ADD,
+                RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            };
+            device.CreateBlendState(&desc, Some(&mut blend))?;
+            let mut raster = None;
+            let desc = D3D11_RASTERIZER_DESC { FillMode: D3D11_FILL_SOLID, CullMode: D3D11_CULL_NONE, DepthClipEnable: true.into(), ..Default::default() };
+            device.CreateRasterizerState(&desc, Some(&mut raster))?;
+            let mut depth = None;
+            let face = D3D11_DEPTH_STENCILOP_DESC { StencilFailOp: D3D11_STENCIL_OP_KEEP, StencilDepthFailOp: D3D11_STENCIL_OP_KEEP, StencilPassOp: D3D11_STENCIL_OP_KEEP, StencilFunc: D3D11_COMPARISON_ALWAYS };
+            let desc = D3D11_DEPTH_STENCIL_DESC { DepthFunc: D3D11_COMPARISON_ALWAYS, DepthWriteMask: D3D11_DEPTH_WRITE_MASK_ZERO, FrontFace: face, BackFace: face, ..Default::default() };
+            device.CreateDepthStencilState(&desc, Some(&mut depth))?;
+            Ok(Self { ctx: device.GetImmediateContext()?, vs: vs.unwrap(), ps: ps.unwrap(), rect: rect.unwrap(), sampler: sampler.unwrap(), blend: blend.unwrap(), raster: raster.unwrap(), depth: depth.unwrap(), textures: VecDeque::new() })
+        }
+    }
+
+    fn draw(&mut self, device: &ID3D11Device, back: &ID3D11Texture2D, pic: &Picture, size: (u32, u32), cursor: Cursor<'_>) -> Result<()> {
+        unsafe {
+            let image = cursor.image;
+            // IDs can be reused after a reconnect; also compare the stored image before reusing its texture.
+            let texture = if let Some(texture) = self.textures.iter().position(|(id, old, _)| *id == cursor.shape && Arc::ptr_eq(old, image)).and_then(|i| self.textures.remove(i)) {
+                texture
+            } else {
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Width: image.w,
+                    Height: image.h,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Usage: D3D11_USAGE_IMMUTABLE,
+                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                    ..Default::default()
+                };
+                let data = D3D11_SUBRESOURCE_DATA { pSysMem: image.bgra.as_ptr() as _, SysMemPitch: image.w * 4, ..Default::default() };
+                let mut tex = None;
+                device.CreateTexture2D(&desc, Some(&data), Some(&mut tex))?;
+                let mut view = None;
+                device.CreateShaderResourceView(&tex.unwrap(), None, Some(&mut view))?;
+                self.textures.retain(|(id, _, _)| *id != cursor.shape);
+                (cursor.shape, image.clone(), view.unwrap())
+            };
+            let view = texture.2.clone();
+            self.textures.push_back(texture);
+            if self.textures.len() > 8 {
+                self.textures.pop_front();
+            }
+
+            let dest = letterbox((pic.w, pic.h), size);
+            let s = (dest.right - dest.left) as f32 / pic.w as f32;
+            let x = dest.left as f32 + (cursor.x as f32 - image.hx as f32) * s;
+            let y = dest.top as f32 + (cursor.y as f32 - image.hy as f32) * s;
+            let rect = [x * 2. / size.0 as f32 - 1., 1. - y * 2. / size.1 as f32, image.w as f32 * s * 2. / size.0 as f32, -(image.h as f32) * s * 2. / size.1 as f32];
+            let mut target = None;
+            device.CreateRenderTargetView(back, None, Some(&mut target))?;
+            let c = &self.ctx;
+            c.UpdateSubresource(&self.rect, 0, None, rect.as_ptr() as _, 0, 0);
+            c.IASetInputLayout(None);
+            c.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            c.VSSetShader(&self.vs, None);
+            c.VSSetConstantBuffers(0, Some(&[Some(self.rect.clone())]));
+            c.PSSetShader(&self.ps, None);
+            c.PSSetShaderResources(0, Some(&[Some(view)]));
+            c.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+            c.RSSetState(&self.raster);
+            c.RSSetViewports(Some(&[D3D11_VIEWPORT { Width: size.0 as f32, Height: size.1 as f32, MinDepth: 0., MaxDepth: 1., ..Default::default() }]));
+            c.OMSetBlendState(&self.blend, None, u32::MAX);
+            c.OMSetDepthStencilState(&self.depth, 0);
+            c.OMSetRenderTargets(Some(&[target]), None);
+            c.Draw(4, 0);
+            // The context must not retain a back-buffer reference across ResizeBuffers.
+            c.OMSetRenderTargets(None, None);
+            c.PSSetShaderResources(0, Some(&[None]));
+            Ok(())
+        }
+    }
+}
+
+fn letterbox(picture: (u32, u32), size: (u32, u32)) -> RECT {
+    let s = (size.0 as f64 / picture.0 as f64).min(size.1 as f64 / picture.1 as f64);
+    let (dw, dh) = ((picture.0 as f64 * s) as i32, (picture.1 as f64 * s) as i32);
+    let (dx, dy) = ((size.0 as i32 - dw) / 2, (size.1 as i32 - dh) / 2);
+    RECT { left: dx, top: dy, right: dx + dw, bottom: dy + dh }
 }
 
 impl Gpu {
@@ -211,11 +373,12 @@ impl Gpu {
             };
             let swap = factory.CreateSwapChainForHwnd(&device, hwnd, &desc, None, None)?;
             factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER)?;
-            Ok(Gpu { device, vdev, vctx, swap, tearing, size: (desc.Width, desc.Height), vp: None })
+            let cursor_code = (cursor_shader(s!("vs"), s!("vs_4_0"))?, cursor_shader(s!("ps"), s!("ps_4_0"))?);
+            Ok(Gpu { device, vdev, vctx, swap, tearing, size: (desc.Width, desc.Height), vp: None, cursor_code, cursor_draw: None })
         }
     }
 
-    pub fn present(&mut self, pic: &Picture, size: (u32, u32)) -> Result<()> {
+    pub fn present(&mut self, pic: &Picture, size: (u32, u32), cursor: Option<Cursor<'_>>) -> Result<()> {
         unsafe {
             let size = (size.0.max(1), size.1.max(1));
             if size != self.size {
@@ -244,10 +407,7 @@ impl Gpu {
                 let src = RECT { left: 0, top: 0, right: pic.w as i32, bottom: pic.h as i32 };
                 c.VideoProcessorSetStreamSourceRect(&vp, 0, true, Some(&src));
                 // Letterbox: keep the stream's aspect ratio inside the window.
-                let s = (size.0 as f64 / pic.w as f64).min(size.1 as f64 / pic.h as f64);
-                let (dw, dh) = ((pic.w as f64 * s) as i32, (pic.h as f64 * s) as i32);
-                let (dx, dy) = ((size.0 as i32 - dw) / 2, (size.1 as i32 - dh) / 2);
-                c.VideoProcessorSetStreamDestRect(&vp, 0, true, Some(&RECT { left: dx, top: dy, right: dx + dw, bottom: dy + dh }));
+                c.VideoProcessorSetStreamDestRect(&vp, 0, true, Some(&letterbox((pic.w, pic.h), size)));
                 let black = D3D11_VIDEO_COLOR { Anonymous: D3D11_VIDEO_COLOR_0 { RGBA: D3D11_VIDEO_COLOR_RGBA { R: 0., G: 0., B: 0., A: 1. } } };
                 c.VideoProcessorSetOutputBackgroundColor(&vp, false, &black);
                 self.vp = Some((en, vp, key));
@@ -272,8 +432,37 @@ impl Gpu {
             let r = self.vctx.VideoProcessorBlt(vp, ov.as_ref(), 0, std::slice::from_ref(&stream));
             drop(ManuallyDrop::take(&mut stream.pInputSurface));
             r?;
+            if let Some(cursor) = cursor {
+                if self.cursor_draw.is_none() {
+                    self.cursor_draw = Some(CursorDraw::new(&self.device, &self.cursor_code)?);
+                }
+                if let Some(draw) = &mut self.cursor_draw {
+                    draw.draw(&self.device, &back, pic, size, cursor)?;
+                }
+            }
             let flags = if self.tearing { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) };
             self.swap.Present(0, flags).ok()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_shaders_compile_without_a_display() {
+        assert!(cursor_shader(s!("vs"), s!("vs_4_0")).is_ok());
+        assert!(cursor_shader(s!("ps"), s!("ps_4_0")).is_ok());
+    }
+
+    #[test]
+    fn letterbox_destinations() {
+        let wide = letterbox((1920, 1080), (2560, 1080));
+        assert_eq!((wide.left, wide.top, wide.right, wide.bottom), (320, 0, 2240, 1080));
+        let tall = letterbox((1920, 1080), (1920, 1440));
+        assert_eq!((tall.left, tall.top, tall.right, tall.bottom), (0, 180, 1920, 1260));
+        let scaled = letterbox((1920, 1080), (960, 540));
+        assert_eq!((scaled.left, scaled.top, scaled.right, scaled.bottom), (0, 0, 960, 540));
     }
 }

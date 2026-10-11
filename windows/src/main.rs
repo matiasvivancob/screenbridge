@@ -6,6 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // no console window
 
 mod config;
+mod cursor;
 mod session;
 mod settings;
 mod tray;
@@ -37,8 +38,9 @@ fn main() {
             fps120: cfg.fps == 120,
             speed: cfg.speed,
             low_latency_rc: cfg.low_latency_rc,
+            cursor_overlay: cfg.cursor_overlay,
         };
-        let spec = viewer::Spec { id: 0, port, peer: None, monitor: m.rect, fullscreen: !args.iter().any(|a| a == "--windowed"), title: format!("ScreenBridge :{port}"), settings };
+        let spec = viewer::Spec { id: 0, port, peer: None, monitor: m.rect, fullscreen: !args.iter().any(|a| a == "--windowed"), title: format!("ScreenBridge :{port}"), settings, cursors: std::sync::Arc::new(cursor::CursorStore::default()) };
         let (tx, rx) = std::sync::mpsc::channel();
         let _h = viewer::open(spec, tx).expect("UDP port in use");
         let _ = rx.recv();
