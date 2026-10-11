@@ -19,8 +19,8 @@ Your mouse and keyboard keep working through whatever you already use to share t
 
 | | |
 |---|---|
-| **Windows 10 (2004+) / 11** | Run `ScreenBridge-Setup-<version>.exe` |
-| **macOS 13+**, Apple Silicon or Intel | Open `ScreenBridge-<version>.dmg`, drag ScreenBridge to Applications, open it |
+| **Windows 10 (2004+) / 11** | Run `ScreenBridge-Setup-<version>.exe`, or unzip `ScreenBridge-<version>-portable.zip` and run `screenbridge.exe` (no install, no runtimes) |
+| **macOS 13+**, Apple Silicon or Intel | Open `ScreenBridge-<version>.dmg`, drag ScreenBridge to Applications, open it (or run the `.app` from `ScreenBridge-<version>-mac.zip` anywhere) |
 
 Step by step, including the first-run approvals on both machines: [docs/INSTALL.md](docs/INSTALL.md).
 

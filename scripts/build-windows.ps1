@@ -19,3 +19,16 @@ Write-Host "Building the installer..."
 & $iscc "/DAppVersion=$version" "$root\installer\ScreenBridge.iss"
 if ($LASTEXITCODE) { throw "Inno Setup failed" }
 Write-Host "Built dist\ScreenBridge-Setup-$version.exe"
+
+# Portable build: the same exe plus a marker file that keeps settings in a data\ folder next to it.
+$stage = "$root\dist\portable-stage\ScreenBridge"
+Remove-Item "$root\dist\portable-stage" -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory $stage | Out-Null
+Copy-Item "$root\windows\target\release\screenbridge.exe" $stage
+Copy-Item "$root\README.md" $stage
+Set-Content "$stage\portable.txt" "ScreenBridge portable mode: settings are kept in the data folder next to screenbridge.exe.`r`nDelete this file to use %APPDATA%\ScreenBridge instead."
+$zip = "$root\dist\ScreenBridge-$version-portable.zip"
+Remove-Item $zip -ErrorAction SilentlyContinue
+Compress-Archive -Path $stage -DestinationPath $zip
+Remove-Item "$root\dist\portable-stage" -Recurse -Force
+Write-Host "Built dist\ScreenBridge-$version-portable.zip"

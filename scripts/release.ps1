@@ -21,12 +21,12 @@ if ($macHost) {
     scp -q "$root\assets\icon.png" "${macHost}:$remote/assets/"
     ssh $macHost "cd $remote && rm -rf mac/build && sh mac/build.sh"
     if ($LASTEXITCODE) { throw "Mac build failed" }
-    scp -q "${macHost}:$remote/mac/build/ScreenBridge-$version.dmg" "$dist\"
+    scp -q "${macHost}:$remote/mac/build/ScreenBridge-$version.dmg" "${macHost}:$remote/mac/build/ScreenBridge-$version-mac.zip" "$dist\"
 } else {
     Write-Host "SB_MAC_HOST not set: skipping the Mac build (run 'sh mac/build.sh' on a Mac)."
 }
 
-$files = Get-ChildItem $dist -File | Where-Object { $_.Name -match "ScreenBridge-.*$([regex]::Escape($version))\.(exe|dmg)$" }
+$files = Get-ChildItem $dist -File | Where-Object { $_.Name -match "^ScreenBridge-.*$([regex]::Escape($version)).*\.(exe|dmg|zip)$" }
 $files | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name } | Set-Content "$dist\SHA256SUMS.txt"
 Get-Content "$dist\SHA256SUMS.txt"
 

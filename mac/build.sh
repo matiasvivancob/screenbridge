@@ -31,4 +31,6 @@ mkdir -p build/dmg
 cp -R "$APP" build/dmg/
 ln -s /Applications build/dmg/Applications
 hdiutil create -quiet -volname "ScreenBridge" -srcfolder build/dmg -ov -format UDZO "build/ScreenBridge-$VERSION.dmg"
-echo "built mac/build/ScreenBridge.app and mac/build/ScreenBridge-$VERSION.dmg"
+# The .app is itself portable; this zip is the same app without the disk-image step.
+ditto -c -k --keepParent "$APP" "build/ScreenBridge-$VERSION-mac.zip"
+echo "built mac/build/ScreenBridge.app, ScreenBridge-$VERSION.dmg and ScreenBridge-$VERSION-mac.zip"

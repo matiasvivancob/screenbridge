@@ -72,8 +72,14 @@ impl Default for DisplayCfg {
     }
 }
 
+/// Where settings live. Portable mode: a `portable.txt` next to the exe keeps everything in `data\` beside it
+/// (so the folder can be moved or run from a USB stick); otherwise %APPDATA%\ScreenBridge.
 pub fn dir() -> PathBuf {
-    let d = PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join("ScreenBridge");
+    let portable = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())).filter(|p| p.join("portable.txt").exists());
+    let d = match portable {
+        Some(p) => p.join("data"),
+        None => PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join("ScreenBridge"),
+    };
     let _ = std::fs::create_dir_all(&d);
     d
 }

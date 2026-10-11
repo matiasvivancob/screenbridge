@@ -33,6 +33,19 @@ A small display icon appears in the menu bar. It has no Dock icon.
 
 ScreenBridge appears in the notification area (tray). If you only see a chevron, click it and drag the icon out.
 
+## Portable (no installer)
+
+If you'd rather not install anything, or you're still changing things:
+
+- **Windows:** unzip `ScreenBridge-<version>-portable.zip` anywhere and run `screenbridge.exe`.
+  Settings are kept in a `data` folder next to it (because of the `portable.txt` file); delete that file to use `%APPDATA%` instead.
+  The exe needs no other files or runtimes. The first run triggers a Windows Firewall prompt: allow it on **private** networks
+  (the installer would have added that rule for you). *Start with Windows* still works from the tray menu and points at wherever the exe is.
+- **Mac:** `ScreenBridge.app` is already portable: it runs from anywhere (Downloads, a USB stick).
+  `ScreenBridge-<version>-mac.zip` is the same app without the disk image. *Open at Login* works best from the Applications folder.
+
+Portable and installed copies can coexist; they keep separate settings and each is its own PC identity on the Mac.
+
 ## 3. First connection
 
 1. On the PC, double-click the tray icon (or right-click → **Extend displays**).
