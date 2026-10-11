@@ -25,7 +25,7 @@ replaces the first only after the Mac has approved it.
 |---|---|
 | `{"type":"hello","pc_id":"<32 hex>","pc_name":"MATIAS-PC","version":1}` | first message; `pc_id` is this PC's random identity |
 | `{"type":"layout","displays":[{"id":0,"name":"Display 1 (PC monitor 2)","width":2560,"height":1440}]}` | the displays the PC offers; sent after `welcome` and whenever settings change. Lets the Mac menu list them. |
-| `{"type":"add","display":{"id":0,"width":2560,"height":1440,"port":47810},"settings":{"codec":"h264","mbps":30,"fps":60,"speed":false,"low_latency_rc":true}}` | turn display `id` on. The viewer is already listening on UDP `port`; the Mac streams to the TCP peer's address. `id` is 0–7. |
+| `{"type":"add","display":{"id":0,"width":2560,"height":1440,"port":47810},"settings":{"codec":"h264|hevc|av1|vp9","mbps":30,"fps":60,"speed":false,"low_latency_rc":true}}` | turn display `id` on. The viewer is already listening on UDP `port`; the Mac streams to the TCP peer's address. `id` is 0–7. |
 | `{"type":"remove","id":0}` | turn display `id` off |
 | `{"type":"ping"}` | every 2 s |
 | `{"type":"stop"}` | disconnect; the Mac removes everything |
@@ -60,9 +60,10 @@ One socket per display, Mac → `pc_ip:port`. Each datagram is a 9-byte header a
 | 0–3 | frame id, u32 big-endian, +1 per frame |
 | 4–5 | chunk index, u16 BE |
 | 6–7 | chunk count, u16 BE (**0 = status text**, payload is UTF-8, e.g. `Mac encode 1.8 ms (max 12.0)`) |
-| 8 | flags: bit0 keyframe, bit1 HEVC (else H.264) |
+| 8 | flags: bit0 keyframe; bits 1–3 codec: 0 H.264, 1 HEVC, 2 AV1, 3 VP9 |
 
-The payload is a chunk of one Annex-B access unit. Keyframes carry their parameter sets (SPS/PPS, plus VPS for HEVC).
+The payload is a chunk of one encoded frame: an Annex-B access unit for H.264/HEVC (keyframes carry SPS/PPS, plus VPS
+for HEVC), one temporal unit of low-overhead OBUs for AV1, one frame (or superframe) for VP9. See [CODECS.md](CODECS.md).
 The viewer accepts datagrams only from the Mac's address, abandons a frame that is not complete 100 ms after its first
 chunk, and drops its whole backlog and resyncs on the next keyframe if handling a packet ever stalls for 80 ms.
 
@@ -73,7 +74,7 @@ because UDP has no acknowledgement):
 |---|---|
 | `K` | send a keyframe (decoder lost sync or the user chose Refresh) |
 | `B<mbps>` | bitrate, 1–200 |
-| `C264` / `C265` | codec |
+| `C264` / `C265` / `CAV1` / `CVP9` | codec |
 | `F60` / `F120` | frame rate |
 | `S0` / `S1` | prioritize encoding speed over quality |
 | `L0` / `L1` | Apple low-latency rate control |

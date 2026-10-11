@@ -349,6 +349,14 @@ impl eframe::App for Settings {
                         .on_hover_text(
                             "More detail at the same bitrate; requires HEVC decoding support.",
                         );
+                    ui.radio_value(&mut self.config.codec, Codec::Av1, "AV1")
+                        .on_hover_text(
+                            "Encoded on the Mac's CPU (SVT-AV1): better quality per Mbps, no limit from the single hardware encoder, uses about 2-3 Mac cores per 1440p display. Needs the AV1 Video Extension here.",
+                        );
+                    ui.radio_value(&mut self.config.codec, Codec::Vp9, "VP9")
+                        .on_hover_text(
+                            "Encoded on the Mac's CPU (libvpx): about 4 Mac cores per 1440p display. Needs the VP9 Video Extensions here.",
+                        );
                 });
                 ui.add(egui::Slider::new(&mut self.config.mbps, 5..=100).text("Bitrate (Mbps)"))
                     .on_hover_text(

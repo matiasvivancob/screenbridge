@@ -16,6 +16,8 @@ First packaged release.
 
 ## Unreleased
 
+- **AV1 and VP9** (software encode on the Mac with SVT-AV1 / libvpx, hardware decode on the PC), switchable live from the
+  viewer menu and in Settings. See docs/CODECS.md for measurements and the PyroWave assessment.
 - Background link: the PC stays connected to the Mac with no displays on; each display toggles individually from the
   tray menu or the Mac's menu bar. Reconnects after sleep/network loss and restores the displays that were on.
 - Settings: connect automatically, and "On at connect" per display.

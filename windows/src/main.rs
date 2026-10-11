@@ -33,7 +33,7 @@ fn main() {
         let cfg = config::Config::load();
         let settings = viewer::Settings {
             mbps: cfg.mbps,
-            hevc: cfg.codec == config::Codec::Hevc,
+            codec: cfg.codec,
             fps120: cfg.fps == 120,
             speed: cfg.speed,
             low_latency_rc: cfg.low_latency_rc,

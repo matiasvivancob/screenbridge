@@ -9,7 +9,8 @@ without touching how mouse and keyboard are shared.
 
 ```
 Mac
-  CGVirtualDisplay ─▶ ScreenCaptureKit (NV12, 60/120 fps) ─▶ VideoToolbox (HW H.264/HEVC) ─▶ UDP chunks
+  CGVirtualDisplay ─▶ ScreenCaptureKit (NV12, 60/120 fps) ─▶ VideoToolbox (HW H.264/HEVC)  ┐
+                                                          └▶ SVT-AV1 / libvpx (CPU AV1/VP9) ┴▶ UDP chunks
                                                                                               │
 PC                                                                                            ▼
   swapchain ◀─ D3D11 video processor ◀─ Media Foundation decoder (DXVA, GPU textures) ◀─ reassembly
@@ -27,6 +28,7 @@ queues in between: a frame is shown as soon as it is decoded.
 | `Agent.swift` | UDP announcements; TCP control server; `Session` per connected PC (approval, add/remove, watchdog); only an approved session becomes the active one |
 | `Screen.swift` | One virtual display: create, capture, encode, packetize; applies the viewer's live settings |
 | `CGVirtualDisplay.h` | Declarations of the private CoreGraphics classes, imported through the bridging header |
+| `softenc.c/.h` | AV1 (SVT-AV1) and VP9 (libvpx) behind a 4-function C API; the libraries are `dlopen`ed from the app bundle |
 
 Decisions worth knowing:
 

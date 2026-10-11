@@ -24,7 +24,7 @@ const HDR: usize = 9;
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub mbps: u32,
-    pub hevc: bool,
+    pub codec: crate::config::Codec,
     pub fps120: bool,
     pub speed: bool,
     pub low_latency_rc: bool,
@@ -81,7 +81,7 @@ fn window_thread(spec: Spec, sock: UdpSocket, closed: mpsc::Sender<usize>, creat
     let s = &spec.settings;
     for c in [
         format!("B{}", s.mbps),
-        if s.hevc { "C265" } else { "C264" }.into(),
+        s.codec.wire().into(),
         if s.fps120 { "F120" } else { "F60" }.into(),
         if s.speed { "S1" } else { "S0" }.into(),
         if s.low_latency_rc { "L1" } else { "L0" }.into(),
@@ -285,11 +285,11 @@ fn receive(sock: UdpSocket, hwnd: isize, title: String, size: Arc<AtomicU64>, cm
                         lost += 1;
                     }
                     last_done = Some(f.id);
-                    let (key, hevc) = (f.flags & 1 != 0, f.flags & 2 != 0);
+                    let (key, codec) = (f.flags & 1 != 0, (f.flags >> 1) & 7);
                     if key {
                         need_key = false;
-                        if dec.as_ref().is_none_or(|d| d.hevc != hevc) {
-                            dec = match video::Decoder::new(&gpu.device, hevc) {
+                        if dec.as_ref().is_none_or(|d| d.codec != codec) {
+                            dec = match video::Decoder::new(&gpu.device, codec) {
                                 Ok(d) => Some(d),
                                 Err(e) => {
                                     status = format!("decoder error: {e}");
@@ -313,7 +313,11 @@ fn receive(sock: UdpSocket, hwnd: isize, title: String, size: Arc<AtomicU64>, cm
                                 frames += 1;
                             }
                             Ok(None) => {}
-                            Err(_) => need_key = true,
+                            Err(e) => {
+                                need_key = true;
+                                // Kept in the title (the "decoder error" prefix survives the once-a-second refresh).
+                                status = format!("decoder error: {e}");
+                            }
                         }
                     }
                 }
@@ -383,7 +387,7 @@ fn receive(sock: UdpSocket, hwnd: isize, title: String, size: Arc<AtomicU64>, cm
         if stat_t.elapsed() >= Duration::from_secs(1) {
             let secs = stat_t.elapsed().as_secs_f64();
             if frames > 0 {
-                let codec = if dec.as_ref().is_some_and(|d| d.hevc) { "HEVC" } else { "H.264" };
+                let codec = dec.as_ref().map_or("H.264", |d| crate::config::Codec::from_id(d.codec).label());
                 status = format!(
                     "{:.0} fps · {mac} · decode {:.1} ms · present {:.1} ms · {:.1} Mbps · {codec}{}",
                     frames as f64 / secs,
@@ -442,8 +446,11 @@ unsafe fn show_menu(hwnd: HWND, st: &State) {
         }
         sub(m, b, "Bitrate");
         let c = CreatePopupMenu().unwrap();
-        item(c, !s.hevc, 201, "H.264");
-        item(c, s.hevc, 202, "HEVC (H.265)");
+        use crate::config::Codec;
+        item(c, s.codec == Codec::H264, 201, "H.264 (hardware encode on the Mac)");
+        item(c, s.codec == Codec::Hevc, 202, "HEVC (hardware encode on the Mac)");
+        item(c, s.codec == Codec::Av1, 203, "AV1 (software encode: uses Mac CPU)");
+        item(c, s.codec == Codec::Vp9, 204, "VP9 (software encode: uses Mac CPU)");
         sub(m, c, "Codec");
         let f = CreatePopupMenu().unwrap();
         item(f, !s.fps120, 301, "60 fps");
@@ -490,9 +497,10 @@ unsafe fn show_menu(hwnd: HWND, st: &State) {
             st.s.borrow_mut().mbps = id - 100;
             Some(format!("B{}", id - 100))
         }
-        201 | 202 => {
-            st.s.borrow_mut().hevc = id == 202;
-            Some(if id == 202 { "C265" } else { "C264" }.into())
+        201..=204 => {
+            let codec = crate::config::Codec::from_id((id - 201) as u8);
+            st.s.borrow_mut().codec = codec;
+            Some(codec.wire().into())
         }
         301 | 302 => {
             st.s.borrow_mut().fps120 = id == 302;

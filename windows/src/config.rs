@@ -48,6 +48,49 @@ pub struct DisplayCfg {
 pub enum Codec {
     H264,
     Hevc,
+    Av1,
+    Vp9,
+}
+
+impl Codec {
+    /// From the id in the video packet header (flags bits 1-3).
+    pub fn from_id(id: u8) -> Codec {
+        match id {
+            1 => Codec::Hevc,
+            2 => Codec::Av1,
+            3 => Codec::Vp9,
+            _ => Codec::H264,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Codec::H264 => "H.264",
+            Codec::Hevc => "HEVC",
+            Codec::Av1 => "AV1",
+            Codec::Vp9 => "VP9",
+        }
+    }
+
+    /// Name in the TCP `add` message.
+    pub fn json(self) -> &'static str {
+        match self {
+            Codec::H264 => "h264",
+            Codec::Hevc => "hevc",
+            Codec::Av1 => "av1",
+            Codec::Vp9 => "vp9",
+        }
+    }
+
+    /// Message on the UDP back channel.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Codec::H264 => "C264",
+            Codec::Hevc => "C265",
+            Codec::Av1 => "CAV1",
+            Codec::Vp9 => "CVP9",
+        }
+    }
 }
 
 impl Default for Config {

@@ -272,7 +272,7 @@ fn link_once(macs: &Macs, cmds: &Receiver<Command>, state: &Shared, notify: &imp
         json!({"type": "layout", "displays": displays})
     };
     let settings_json = |cfg: &Config| {
-        json!({"codec": if cfg.codec == config::Codec::Hevc { "hevc" } else { "h264" },
+        json!({"codec": cfg.codec.json(),
                "mbps": cfg.mbps, "fps": cfg.fps, "speed": cfg.speed, "low_latency_rc": cfg.low_latency_rc})
     };
 
@@ -298,7 +298,7 @@ fn link_once(macs: &Macs, cmds: &Receiver<Command>, state: &Shared, notify: &imp
             title: format!("ScreenBridge · Display {}", id + 1),
             settings: viewer::Settings {
                 mbps: cfg.mbps,
-                hevc: cfg.codec == config::Codec::Hevc,
+                codec: cfg.codec,
                 fps120: cfg.fps == 120,
                 speed: cfg.speed,
                 low_latency_rc: cfg.low_latency_rc,

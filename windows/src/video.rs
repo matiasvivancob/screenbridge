@@ -24,15 +24,21 @@ pub struct Picture {
 pub struct Decoder {
     mft: IMFTransform,
     _mgr: IMFDXGIDeviceManager,
-    pub hevc: bool,
+    /// Codec id as in the packet header: 0 H.264, 1 HEVC, 2 AV1, 3 VP9.
+    pub codec: u8,
     size: (u32, u32),
     t: i64,
 }
 
 impl Decoder {
-    pub fn new(device: &ID3D11Device, hevc: bool) -> Result<Self> {
+    pub fn new(device: &ID3D11Device, codec: u8) -> Result<Self> {
         unsafe {
-            let sub = if hevc { MFVideoFormat_HEVC } else { MFVideoFormat_H264 };
+            let (sub, needs) = match codec {
+                1 => (MFVideoFormat_HEVC, "HEVC needs Microsoft's HEVC Video Extensions"),
+                2 => (MFVideoFormat_AV1, "AV1 needs Microsoft's AV1 Video Extension"),
+                3 => (MFVideoFormat_VP90, "VP9 needs Microsoft's VP9 Video Extensions"),
+                _ => (MFVideoFormat_H264, "no H.264 decoder"),
+            };
             let info = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: sub };
             let mut acts: *mut Option<IMFActivate> = std::ptr::null_mut();
             let mut n = 0u32;
@@ -46,7 +52,7 @@ impl Decoder {
                 &mut n,
             )?;
             if n == 0 {
-                return Err(Error::new(E_FAIL, "no decoder for this codec (HEVC needs the HEVC Video Extensions)"));
+                return Err(Error::new(E_FAIL, needs));
             }
             let list = std::slice::from_raw_parts_mut(acts, n as usize);
             let mft: IMFTransform = list[0].as_ref().unwrap().ActivateObject()?;
@@ -70,7 +76,7 @@ impl Decoder {
             t.SetUINT64(&MF_MT_FRAME_SIZE, (1920u64 << 32) | 1080)?;
             t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
             mft.SetInputType(0, &t, 0)?;
-            let mut d = Decoder { mft, _mgr: mgr, hevc, size: (0, 0), t: 0 };
+            let mut d = Decoder { mft, _mgr: mgr, codec, size: (0, 0), t: 0 };
             let _ = d.set_output(); // some decoders only offer output types after the first SPS
             d.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             d.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
@@ -109,6 +115,7 @@ impl Decoder {
             let s = MFCreateSample()?;
             s.AddBuffer(&buf)?;
             s.SetSampleTime(self.t)?;
+            s.SetSampleDuration(166_667)?;
             self.t += 166_667;
             self.mft.ProcessInput(0, &s, 0)?;
 

@@ -266,7 +266,12 @@ final class Session {
         }
         let st = m["settings"] as? [String: Any] ?? [:]
         var enc = EncoderSettings()
-        enc.hevc = st["codec"] as? String == "hevc"
+        switch st["codec"] as? String {
+        case "hevc": enc.codec = .hevc
+        case "av1": enc.codec = .av1
+        case "vp9": enc.codec = .vp9
+        default: enc.codec = .h264
+        }
         enc.mbps = min(max(st["mbps"] as? Int ?? 30, 1), 200)
         enc.fps = st["fps"] as? Int == 120 ? 120 : 60
         enc.speed = st["speed"] as? Bool ?? false

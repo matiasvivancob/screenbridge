@@ -83,8 +83,25 @@ final class Link {
     }
 }
 
+/// Wire ids (header flags bits 1-3): see docs/PROTOCOL.md.
+enum VideoCodec: Int {
+    case h264 = 0, hevc = 1, av1 = 2, vp9 = 3
+
+    var label: String {
+        switch self {
+        case .h264: return "H.264"
+        case .hevc: return "HEVC"
+        case .av1: return "AV1"
+        case .vp9: return "VP9"
+        }
+    }
+
+    /// Encoded on the CPU with SVT-AV1 / libvpx instead of the media engine.
+    var isSoftware: Bool { self == .av1 || self == .vp9 }
+}
+
 struct EncoderSettings: Equatable {
-    var hevc = false
+    var codec: VideoCodec = .h264
     var fps = 60
     var speed = false // PrioritizeEncodingSpeedOverQuality
     var mbps = 30
@@ -106,6 +123,10 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
     private var encoderReady = false
     // Only touched on q (or in init, before capture starts):
     var session: VTCompressionSession?
+    var soft: OpaquePointer? // SBSoftEncoder*, used instead of `session` for AV1 / VP9
+    let softQ = DispatchQueue(label: "softenc", qos: .userInteractive) // serial: conversion + encode
+    var softBusy = false // on q
+    var softPending: CVPixelBuffer? // newest frame that arrived while the encoder was busy (on q)
     var enc = EncoderSettings()
     var last: CVPixelBuffer?
     var forceKey = true
@@ -149,17 +170,41 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
         if !display.apply(s) { log("display \(index + 1): \(fps) Hz mode rejected") }
     }
 
-    /// (Re)creates the encoder from `enc`. False if the hardware encoder couldn't be set up.
+    /// (Re)creates the encoder from `enc`. False if it couldn't be set up.
     @discardableResult
     func makeSession() -> Bool {
         if let s = session { VTCompressionSessionInvalidate(s) }
         session = nil
+        // Destroyed on its own queue so an encode in flight finishes first (softQ never waits on q).
+        softQ.sync {
+            if let e = self.soft { sb_soft_destroy(e) }
+            self.soft = nil
+        }
+        softBusy = false
+        softPending = nil
+        if enc.codec.isSoftware {
+            if sb_soft_available(Int32(enc.codec.rawValue)) == 0 {
+                log("display \(index + 1): \(enc.codec.label) isn't available in this build, using H.264")
+                enc.codec = .h264
+            } else {
+                var err = [CChar](repeating: 0, count: 160)
+                soft = sb_soft_create(Int32(enc.codec.rawValue), Int32(w), Int32(h), Int32(enc.fps), Int32(enc.mbps * 1000), &err, err.count)
+                guard soft != nil else {
+                    log("display \(index + 1): \(enc.codec.label) encoder failed: \(String(cString: err))")
+                    return false
+                }
+                forceKey = true
+                pts = 0
+                log("display \(index + 1): \(enc.codec.label) (software), \(enc.fps) fps, \(enc.mbps) Mbps")
+                return true
+            }
+        }
         var spec: [String: Any] = [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String: true]
         if enc.lowLatencyRC { spec[kVTVideoEncoderSpecification_EnableLowLatencyRateControl as String] = true }
         func create() -> OSStatus {
             VTCompressionSessionCreate(
                 allocator: nil, width: Int32(w), height: Int32(h),
-                codecType: enc.hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
+                codecType: enc.codec == .hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
                 encoderSpecification: spec as CFDictionary, imageBufferAttributes: nil, compressedDataAllocator: nil,
                 outputCallback: nil, refcon: nil, compressionSessionOut: &session)
         }
@@ -172,7 +217,7 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
         guard st == noErr, let s = session else { log("display \(index + 1): encoder failed (\(st))"); return false }
         var props: [CFString: CFTypeRef] = [
             kVTCompressionPropertyKey_RealTime: kCFBooleanTrue,
-            kVTCompressionPropertyKey_ProfileLevel: enc.hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_ConstrainedHigh_AutoLevel,
+            kVTCompressionPropertyKey_ProfileLevel: enc.codec == .hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_ConstrainedHigh_AutoLevel,
             kVTCompressionPropertyKey_AllowFrameReordering: kCFBooleanFalse,
             kVTCompressionPropertyKey_AverageBitRate: NSNumber(value: enc.mbps * 1_000_000),
             kVTCompressionPropertyKey_ExpectedFrameRate: NSNumber(value: enc.fps),
@@ -186,11 +231,11 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
         if prep != noErr { log("display \(index + 1): encoder prepare failed (\(prep))") }
         forceKey = true
         pts = 0
-        log("display \(index + 1): \(enc.hevc ? "HEVC" : "H.264"), \(enc.fps) fps, \(enc.mbps) Mbps\(enc.speed ? ", speed priority" : "")\(enc.lowLatencyRC ? "" : ", standard rate control")")
+        log("display \(index + 1): \(enc.codec.label), \(enc.fps) fps, \(enc.mbps) Mbps\(enc.speed ? ", speed priority" : "")\(enc.lowLatencyRC ? "" : ", standard rate control")")
         return prep == noErr
     }
 
-    /// Control messages from the viewer: "K", "B<mbps>", "C264"/"C265", "F60"/"F120", "S0"/"S1", "L0"/"L1".
+    /// Control messages from the viewer: "K", "B<mbps>", "C264"/"C265"/"CAV1"/"CVP9", "F60"/"F120", "S0"/"S1", "L0"/"L1".
     func handle(_ m: String) {
         if m == "K" { return requestKey() }
         q.async {
@@ -198,7 +243,13 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
             let v = Int(m.dropFirst())
             switch m.first {
             case "B": if let v, (1...200).contains(v) { e.mbps = v }
-            case "C": e.hevc = m == "C265"
+            case "C":
+                switch m {
+                case "C265": e.codec = .hevc
+                case "CAV1": e.codec = .av1
+                case "CVP9": e.codec = .vp9
+                default: e.codec = .h264
+                }
             case "F": if let v, v == 60 || v == 120 { e.fps = v }
             case "S": e.speed = m == "S1"
             case "L": e.lowLatencyRC = m == "L1"
@@ -212,8 +263,11 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(e.fps))
                 self.stream?.updateConfiguration(self.cfg) { err in if let err { log("frame rate change: \(err)") } }
             }
-            if (e.hevc, e.fps, e.speed, e.lowLatencyRC) == (old.hevc, old.fps, old.speed, old.lowLatencyRC), let s = self.session {
+            let sameEncoder = (e.codec, e.fps, e.speed, e.lowLatencyRC) == (old.codec, old.fps, old.speed, old.lowLatencyRC)
+            if sameEncoder, let s = self.session {
                 VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: e.mbps * 1_000_000))
+                log("display \(self.index + 1): bitrate \(e.mbps) Mbps")
+            } else if sameEncoder, let sw = self.soft, sb_soft_set_bitrate(sw, Int32(e.mbps * 1000)) == 0 {
                 log("display \(self.index + 1): bitrate \(e.mbps) Mbps")
             } else if self.makeSession() {
                 if let pb = self.last { self.encode(pb) } // show the change even on a static screen
@@ -286,6 +340,11 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
             if let s = self.session { VTCompressionSessionInvalidate(s) }
             self.session = nil
             self.last = nil
+            self.softPending = nil
+            self.softQ.async { // after any encode in flight
+                if let e = self.soft { sb_soft_destroy(e) }
+                self.soft = nil
+            }
         }
     }
 
@@ -303,13 +362,14 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func encode(_ pb: CVPixelBuffer) {
+        if enc.codec.isSoftware { return encodeSoft(pb) }
         guard let s = session else { return }
         var props: CFDictionary?
         if forceKey {
             props = [kVTEncodeFrameOptionKey_ForceKeyFrame as String: true] as CFDictionary
             forceKey = false
         }
-        let hevc = enc.hevc // frames still in flight after a codec switch keep their own label
+        let codec = enc.codec // frames still in flight after a codec switch keep their own label
         let t0 = DispatchTime.now().uptimeNanoseconds
         // Evenly spaced timestamps, not capture times: measured on M1 Pro, wall-clock PTS makes the
         // low-latency encoder hold most frames ~12 ms (median 11.6 ms vs 1.7 ms).
@@ -319,7 +379,7 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
             duration: .invalid, frameProperties: props, infoFlagsOut: nil
         ) { [weak self] status, _, sb in
             guard status == noErr, let sb, let self else { return }
-            self.ship(sb, hevc: hevc, encodeNs: DispatchTime.now().uptimeNanoseconds - t0)
+            self.shipVT(sb, codec: codec, encodeNs: DispatchTime.now().uptimeNanoseconds - t0)
         }
         // A session that keeps refusing frames is a dead display: say so instead of streaming nothing forever.
         if r == noErr {
@@ -343,13 +403,59 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
-    func ship(_ sb: CMSampleBuffer, hevc: Bool, encodeNs: UInt64) {
+    /// Software encoders (AV1, VP9): convert and encode on `softQ`, keeping only the newest frame while busy.
+    func encodeSoft(_ pb: CVPixelBuffer) {
+        if softBusy {
+            softPending = pb
+            return
+        }
+        guard let e = soft else { return }
+        softBusy = true
+        let force = forceKey
+        forceKey = false
+        let codec = enc.codec
+        softQ.async {
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            CVPixelBufferLockBaseAddress(pb, .readOnly)
+            var out = [UInt8](repeating: 0, count: 4 << 20) // a keyframe at the highest bitrates is well under this
+            var isKey: Int32 = 0
+            var n: Int32 = -1
+            if let y = CVPixelBufferGetBaseAddressOfPlane(pb, 0), let uv = CVPixelBufferGetBaseAddressOfPlane(pb, 1) {
+                n = sb_soft_encode(
+                    e, y.assumingMemoryBound(to: UInt8.self), Int32(CVPixelBufferGetBytesPerRowOfPlane(pb, 0)),
+                    uv.assumingMemoryBound(to: UInt8.self), Int32(CVPixelBufferGetBytesPerRowOfPlane(pb, 1)),
+                    force ? 1 : 0, &out, out.count, &isKey)
+            }
+            CVPixelBufferUnlockBaseAddress(pb, .readOnly)
+            if n > 0 {
+                self.encodeFailures = 0
+                self.sendFrame(Array(out[0..<Int(n)]), key: isKey != 0, codec: codec, encodeNs: DispatchTime.now().uptimeNanoseconds - t0)
+            } else if n < 0 {
+                self.q.async {
+                    self.encodeFailures += 1
+                    if self.encodeFailures == 30 {
+                        DispatchQueue.main.async { self.onError?("The \(codec.label) encoder stopped working (error \(n)).") }
+                    }
+                }
+            }
+            self.q.async {
+                self.softBusy = false
+                if let next = self.softPending {
+                    self.softPending = nil
+                    self.encodeSoft(next)
+                }
+            }
+        }
+    }
+
+    /// Hardware (VideoToolbox) output -> Annex-B bytes -> sendFrame.
+    func shipVT(_ sb: CMSampleBuffer, codec: VideoCodec, encodeNs: UInt64) {
         let att = (CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false) as? [[String: Any]])?.first
         let key = !((att?[kCMSampleAttachmentKey_NotSync as String] as? Bool) ?? false)
         let sc: [UInt8] = [0, 0, 0, 1]
         var out: [UInt8] = []
         if key, let fmt = sb.formatDescription {
-            let parameterSet = hevc ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex : CMVideoFormatDescriptionGetH264ParameterSetAtIndex
+            let parameterSet = codec == .hevc ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex : CMVideoFormatDescriptionGetH264ParameterSetAtIndex
             var n = 0
             _ = parameterSet(fmt, 0, nil, nil, &n, nil)
             for i in 0..<n {
@@ -371,7 +477,11 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
             out += data[i..<i + len]
             i += len
         }
+        sendFrame(out, key: key, codec: codec, encodeNs: encodeNs)
+    }
 
+    /// Packetizes one encoded frame (any codec) and sends it; reports encode time once a second.
+    func sendFrame(_ out: [UInt8], key: Bool, codec: VideoCodec, encodeNs: UInt64) {
         sendLock.lock()
         defer { sendLock.unlock() }
         let count = (out.count + CHUNK - 1) / CHUNK
@@ -382,7 +492,7 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
             withUnsafeBytes(of: frameID.bigEndian) { p.append(contentsOf: $0) }
             withUnsafeBytes(of: UInt16(c).bigEndian) { p.append(contentsOf: $0) }
             withUnsafeBytes(of: UInt16(count).bigEndian) { p.append(contentsOf: $0) }
-            p.append((key ? 1 : 0) | (hevc ? 2 : 0))
+            p.append(UInt8((key ? 1 : 0) | (codec.rawValue << 1)))
             p += out[c * CHUNK..<min(out.count, (c + 1) * CHUNK)]
             link.send(p)
         }

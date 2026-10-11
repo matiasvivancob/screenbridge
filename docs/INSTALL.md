@@ -8,7 +8,7 @@ Ethernet on both is strongly recommended; Wi-Fi works but adds delay and stutter
 | | |
 |---|---|
 | Mac | macOS 13 or later. Developed and tested on macOS 27.2 with an M1 Pro; other versions are untested. |
-| PC | Windows 10 version 2004 or later, or Windows 11. A GPU that can decode H.264 in hardware (any GPU from the last decade). HEVC additionally needs Microsoft's *HEVC Video Extensions* from the Microsoft Store. |
+| PC | Windows 10 version 2004 or later, or Windows 11. A GPU that can decode H.264 in hardware (any GPU from the last decade). HEVC, AV1 and VP9 additionally need Microsoft's *HEVC Video Extensions*, *AV1 Video Extension* and *VP9 Video Extensions* from the Microsoft Store (H.264 needs nothing). AV1 also needs a GPU with AV1 decode. |
 | Network | Same subnet. UDP ports 47801 (discovery) and 47810+ (video), TCP 47800 (control). |
 
 ## 1. Mac
