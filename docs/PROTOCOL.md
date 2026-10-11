@@ -59,7 +59,7 @@ One socket per display, Mac → `pc_ip:port`. Each datagram is a 9-byte header a
 |---|---|
 | 0–3 | frame id, u32 big-endian, +1 per frame |
 | 4–5 | chunk index, u16 BE |
-| 6–7 | chunk count, u16 BE (**0 = status text**, payload is UTF-8, e.g. `Mac encode 1.8 ms (max 12.0)`) |
+| 6–7 | chunk count, u16 BE (**0 = side-channel packet**, see "Side-channel packets" below) |
 | 8 | flags: bit0 keyframe; bits 1–3 codec: 0 H.264, 1 HEVC, 2 AV1, 3 VP9 |
 
 The payload is a chunk of one encoded frame: an Annex-B access unit for H.264/HEVC (keyframes carry SPS/PPS, plus VPS
@@ -78,3 +78,52 @@ because UDP has no acknowledgement):
 | `F60` / `F120` | frame rate |
 | `S0` / `S1` | prioritize encoding speed over quality |
 | `L0` / `L1` | Apple low-latency rate control |
+
+## Side-channel packets (Mac → PC, same UDP socket as the video)
+
+A packet whose chunk count is 0 carries no video. The first payload byte is the kind:
+
+| Kind | Payload after the kind byte |
+|---|---|
+| `0x01` status text | UTF-8, e.g. `Mac encode 1.8 ms (max 12.0)`; the viewer shows it in its title |
+| `0x02` cursor state | 9 bytes, see below |
+
+Receivers ignore unknown kinds.
+
+## Cursor overlay (optional, chosen per viewer)
+
+By default the Mac paints its pointer into the captured video, so the pointer has the full video latency.
+With the overlay on, the Mac leaves the pointer out of the video and sends it separately; the PC draws it on top of
+the latest video frame, at its own refresh rate, without waiting for a new video frame.
+
+**Enabling.** The PC sends `P1` on the UDP back channel (and repeats it every 2 s with the other settings) to turn the
+overlay on and `P0` to turn it off. A Mac that has never received `P1` keeps painting the pointer into the video.
+On `P1` the Mac sets the stream's cursor capture off for that display and starts sending cursor state to it;
+on `P0` it paints the pointer into the video again and stops.
+
+**Cursor state** (UDP, kind `0x02`, 10 bytes in total including the kind byte, all integers big-endian):
+
+| Byte | Field |
+|---|---|
+| 0 | kind = `0x02` |
+| 1 | flags: bit0 = pointer visible (macOS hides it while typing), bit1 = pointer is on *this* display |
+| 2–3 | seq, u16, +1 per state packet sent on this display (wraps; receivers drop a packet older than the newest seen, by modular compare) |
+| 4–5 | x, i16: pointer **hotspot** in this display's pixels (the stream's pixel grid), may be outside the display when bit1 is 0 |
+| 6–7 | y, i16, same |
+| 8–9 | shape id, u16: which `cursor_shape` image to draw |
+
+The Mac sends state to every display that has the overlay on, whenever position, visibility or shape changes (at most
+about 250 packets per second), plus a heartbeat every 250 ms while the pointer is on that display. When the pointer
+leaves a display it sends three packets with bit1 = 0, a few milliseconds apart (UDP may drop one). The PC treats the
+pointer as hidden if it has heard nothing for 1 second.
+
+**Cursor shape** (TCP control channel, Mac → PC, reliable):
+
+```json
+{"type":"cursor_shape","id":7,"w":32,"h":32,"hx":4,"hy":4,"bgra":"<base64 of w*h*4 bytes>"}
+```
+
+`bgra` is premultiplied-alpha BGRA, row-major, top row first, at the display's scale (virtual displays are 1×), at most
+128×128. `hx`,`hy` is the hotspot inside the image. `id` (u16) changes whenever the pointer image changes. The Mac sends
+the current shape on `welcome` and again on every change. The PC keeps recent shapes by id and draws the one named in
+the latest state; until the named shape has arrived it keeps drawing the previous one.
