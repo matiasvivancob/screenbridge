@@ -196,6 +196,9 @@ impl eframe::App for Settings {
                     .weak(),
                 );
 
+                ui.checkbox(&mut self.config.auto_connect, "Connect to the Mac in the background when ScreenBridge starts")
+                    .on_hover_text("Keeps a tiny link to the Mac. No displays turn on until you toggle them (or mark them \"On at connect\").");
+
                 ui.separator();
                 ui.heading("Displays");
                 let mut remove = None;
@@ -211,6 +214,7 @@ impl eframe::App for Settings {
                                 ui.label("Width × height");
                                 ui.label("Monitor");
                                 ui.label("Fullscreen");
+                                ui.label("On at connect");
                                 ui.label("");
                                 ui.end_row();
 
@@ -296,6 +300,7 @@ impl eframe::App for Settings {
                                         .response
                                         .on_hover_text(monitor_label);
                                     ui.checkbox(&mut display.fullscreen, "");
+                                    ui.checkbox(&mut display.auto_on, "");
                                     if ui.button("✕").on_hover_text("Remove display").clicked() {
                                         remove = Some(index);
                                     }
@@ -330,6 +335,7 @@ impl eframe::App for Settings {
                         height: monitor.height(),
                         monitor: monitor.device.clone(),
                         fullscreen: true,
+                        auto_on: false,
                     });
                 }
 

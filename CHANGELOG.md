@@ -14,4 +14,15 @@ First packaged release.
   `ScreenBridge-<version>-mac.zip`.
 - The Windows exe links the C runtime statically, so it runs on a clean Windows without the Visual C++ Redistributable.
 
+## Unreleased
+
+- Background link: the PC stays connected to the Mac with no displays on; each display toggles individually from the
+  tray menu or the Mac's menu bar. Reconnects after sleep/network loss and restores the displays that were on.
+- Settings: connect automatically, and "On at connect" per display.
+- Robustness (from an independent code review): deadlock between the Mac's main and encoder queues, SIGPIPE, socket
+  teardown races, cancellable startup, encoder failures reported, bounded and source-filtered UDP reassembly,
+  stall recovery, GPU reset recovery, no lost bytes on TCP read timeouts, pong deadline, no eviction of the active PC
+  before approval, revoke disconnects, handshake timeout, tray recovery after Explorer restarts.
+- Installer only stops its own copy; release script refuses stale artifacts; tests fail loudly.
+
 Earlier prototype work (command-line sender and viewer) is in the git history.

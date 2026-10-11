@@ -63,7 +63,11 @@ var
   code: Integer;
 begin
   // The tray app has no window the installer can close politely; ending it makes the Mac drop its virtual displays.
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM screenbridge.exe /F', '', SW_HIDE, ewWaitUntilTerminated, code);
+  // Only the installed copy: a portable copy running elsewhere is left alone.
+  Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    '-NoProfile -Command "Get-Process -Name screenbridge -ErrorAction SilentlyContinue | Where-Object Path -eq ''' +
+      ExpandConstant('{app}\screenbridge.exe') + ''' | Stop-Process -Force"',
+    '', SW_HIDE, ewWaitUntilTerminated, code);
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;

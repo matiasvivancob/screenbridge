@@ -16,13 +16,19 @@ func log(_ s: String) { NSLog("%@", s) }
 
 /// UDP socket "connected" to one viewer port on the PC.
 final class Link {
-    let fd: Int32
-    private var closed = false
+    private let fd: Int32
+    private let lock = NSLock()
+    private var closed = false // guarded by lock
 
     init?(host: String, port: UInt16) {
         fd = socket(AF_INET, SOCK_DGRAM, 0)
         var size: Int32 = 4 << 20
         setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, socklen_t(MemoryLayout<Int32>.size))
+        var one: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+        // The reader wakes up every 200 ms to notice close(); it is the only place the descriptor is closed.
+        var tv = timeval(tv_sec: 0, tv_usec: 200_000)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         var a = sockaddr_in()
         a.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         a.sin_family = sa_family_t(AF_INET)
@@ -39,15 +45,27 @@ final class Link {
 
     func send(_ p: [UInt8]) {
         for _ in 0..<200 {
-            if Darwin.send(fd, p, p.count, 0) >= 0 || errno != ENOBUFS { return }
+            lock.lock()
+            if closed { lock.unlock(); return }
+            let r = Darwin.send(fd, p, p.count, 0)
+            let err = errno
+            lock.unlock()
+            if r >= 0 || err != ENOBUFS { return }
             usleep(50) // socket buffer full during a keyframe burst
         }
     }
 
+    /// After this returns nothing sends on the socket again; the reader thread closes the descriptor.
     func close() {
+        lock.lock()
         closed = true
-        shutdown(fd, SHUT_RDWR)
-        Darwin.close(fd) // wakes the receive thread, which then exits
+        lock.unlock()
+    }
+
+    private var isClosed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return closed
     }
 
     /// Control messages from the viewer (see Screen.handle).
@@ -55,11 +73,12 @@ final class Link {
         let fd = self.fd
         Thread.detachNewThread {
             var b = [UInt8](repeating: 0, count: 64)
-            while !self.closed {
+            while !self.isClosed {
                 let n = recv(fd, &b, b.count, 0)
                 if n > 0, let m = String(bytes: b[0..<n], encoding: .utf8) { f(m) }
-                else if n < 0 { usleep(100_000) } // ECONNREFUSED while the viewer isn't running
+                else if n < 0 && errno != EAGAIN { usleep(100_000) } // ECONNREFUSED while the viewer isn't running
             }
+            Darwin.close(fd)
         }
     }
 }
@@ -81,6 +100,10 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
     let cfg = SCStreamConfiguration()
     /// Called on the main queue if capture fails or stops on its own.
     var onError: ((String) -> Void)?
+    private let stateLock = NSLock()
+    private var stopped = false // guarded by stateLock: stop() cancels any startup still in flight
+    private var encodeFailures = 0
+    private var encoderReady = false
     // Only touched on q (or in init, before capture starts):
     var session: VTCompressionSession?
     var enc = EncoderSettings()
@@ -115,7 +138,7 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
         enc = settings
         super.init()
         setMode(fps: enc.fps)
-        makeSession()
+        encoderReady = makeSession()
         link.onMessage { [weak self] m in self?.handle(m) }
     }
 
@@ -126,8 +149,9 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
         if !display.apply(s) { log("display \(index + 1): \(fps) Hz mode rejected") }
     }
 
-    /// (Re)creates the encoder from `enc`.
-    func makeSession() {
+    /// (Re)creates the encoder from `enc`. False if the hardware encoder couldn't be set up.
+    @discardableResult
+    func makeSession() -> Bool {
         if let s = session { VTCompressionSessionInvalidate(s) }
         session = nil
         var spec: [String: Any] = [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String: true]
@@ -145,7 +169,7 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
             spec.removeValue(forKey: kVTVideoEncoderSpecification_EnableLowLatencyRateControl as String)
             st = create()
         }
-        guard st == noErr, let s = session else { log("display \(index + 1): encoder failed (\(st))"); return }
+        guard st == noErr, let s = session else { log("display \(index + 1): encoder failed (\(st))"); return false }
         var props: [CFString: CFTypeRef] = [
             kVTCompressionPropertyKey_RealTime: kCFBooleanTrue,
             kVTCompressionPropertyKey_ProfileLevel: enc.hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_ConstrainedHigh_AutoLevel,
@@ -158,10 +182,12 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
             let r = VTSessionSetProperty(s, key: k, value: v)
             if r != noErr { log("display \(index + 1): \(k) rejected (\(r))") }
         }
-        VTCompressionSessionPrepareToEncodeFrames(s)
+        let prep = VTCompressionSessionPrepareToEncodeFrames(s)
+        if prep != noErr { log("display \(index + 1): encoder prepare failed (\(prep))") }
         forceKey = true
         pts = 0
         log("display \(index + 1): \(enc.hevc ? "HEVC" : "H.264"), \(enc.fps) fps, \(enc.mbps) Mbps\(enc.speed ? ", speed priority" : "")\(enc.lowLatencyRC ? "" : ", standard rate control")")
+        return prep == noErr
     }
 
     /// Control messages from the viewer: "K", "B<mbps>", "C264"/"C265", "F60"/"F120", "S0"/"S1", "L0"/"L1".
@@ -182,28 +208,41 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
             guard e != old else { return }
             self.enc = e
             if e.fps != old.fps {
-                DispatchQueue.main.sync { self.setMode(fps: e.fps) }
+                DispatchQueue.main.async { self.setMode(fps: e.fps) }
                 self.cfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(e.fps))
                 self.stream?.updateConfiguration(self.cfg) { err in if let err { log("frame rate change: \(err)") } }
             }
             if (e.hevc, e.fps, e.speed, e.lowLatencyRC) == (old.hevc, old.fps, old.speed, old.lowLatencyRC), let s = self.session {
                 VTSessionSetProperty(s, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: e.mbps * 1_000_000))
                 log("display \(self.index + 1): bitrate \(e.mbps) Mbps")
-            } else {
-                self.makeSession()
+            } else if self.makeSession() {
                 if let pb = self.last { self.encode(pb) } // show the change even on a static screen
+            } else {
+                self.encoderReady = false
+                DispatchQueue.main.async { self.onError?("The Mac's video encoder couldn't switch to those settings.") }
             }
         }
     }
 
+    private var isStopped: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return stopped
+    }
+
     func start() {
+        guard encoderReady else {
+            DispatchQueue.main.async { self.onError?("The Mac's hardware video encoder couldn't start for this display.") }
+            return
+        }
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { content, err in
+            if self.isStopped { return }
             if let err {
                 DispatchQueue.main.async { self.onError?("Screen capture unavailable: \(err.localizedDescription)") }
                 return
             }
             guard let scd = content?.displays.first(where: { $0.displayID == self.display.displayID }) else {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.start() } // display not visible yet
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { if !self.isStopped { self.start() } } // not visible yet
                 return
             }
             let cfg = self.cfg
@@ -220,23 +259,33 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
                 DispatchQueue.main.async { self.onError?("Capture setup failed: \(error.localizedDescription)") }
                 return
             }
+            self.stateLock.lock()
+            let cancelled = self.stopped
+            if !cancelled { self.stream = st }
+            self.stateLock.unlock()
+            if cancelled { return }
             st.startCapture { e in
                 if let e { DispatchQueue.main.async { self.onError?("Capture failed: \(e.localizedDescription)") } }
+                if self.isStopped { st.stopCapture { _ in } } // stop() raced with startup
             }
-            self.stream = st
             log("display \(self.index + 1) (id \(self.display.displayID)): \(self.w)x\(self.h) streaming")
         }
     }
 
     /// Stops streaming. The virtual display disappears when this object is released.
     func stop() {
-        stream?.stopCapture { _ in }
+        stateLock.lock()
+        stopped = true
+        let st = stream
         stream = nil
+        stateLock.unlock()
+        st?.stopCapture { _ in }
         link.close()
-        q.sync {
-            if let s = session { VTCompressionSessionInvalidate(s) }
-            session = nil
-            last = nil
+        // Asynchronous on purpose: the encoder queue may be waiting on the main queue, and this runs on main.
+        q.async {
+            if let s = self.session { VTCompressionSessionInvalidate(s) }
+            self.session = nil
+            self.last = nil
         }
     }
 
@@ -265,12 +314,21 @@ final class Screen: NSObject, SCStreamOutput, SCStreamDelegate {
         // Evenly spaced timestamps, not capture times: measured on M1 Pro, wall-clock PTS makes the
         // low-latency encoder hold most frames ~12 ms (median 11.6 ms vs 1.7 ms).
         pts += 1
-        _ = VTCompressionSessionEncodeFrame(
+        let r = VTCompressionSessionEncodeFrame(
             s, imageBuffer: pb, presentationTimeStamp: CMTime(value: pts, timescale: CMTimeScale(enc.fps)),
             duration: .invalid, frameProperties: props, infoFlagsOut: nil
         ) { [weak self] status, _, sb in
             guard status == noErr, let sb, let self else { return }
             self.ship(sb, hevc: hevc, encodeNs: DispatchTime.now().uptimeNanoseconds - t0)
+        }
+        // A session that keeps refusing frames is a dead display: say so instead of streaming nothing forever.
+        if r == noErr {
+            encodeFailures = 0
+        } else {
+            encodeFailures += 1
+            if encodeFailures == 60 {
+                DispatchQueue.main.async { self.onError?("The Mac's video encoder stopped accepting frames (error \(r)).") }
+            }
         }
     }
 

@@ -1,6 +1,11 @@
 # Silent per-user install -> verify -> uninstall round trip of dist\ScreenBridge-Setup-<version>.exe.
 # Uses /CURRENTUSER (no UAC, so no firewall rule); the firewall step needs a real elevated install.
 $ErrorActionPreference = 'Stop'
+$script:failed = 0
+function Check($name, $ok) { if (-not $ok) { $script:failed++ }; Write-Host ("{0}  {1}" -f $(if ($ok) { 'PASS' } else { 'FAIL' }), $name) }
+$runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+# The test installs and uninstalls the autostart entry; put the user's real one back afterwards.
+$savedRun = (Get-ItemProperty $runKey -Name ScreenBridge -ErrorAction SilentlyContinue).ScreenBridge
 $root = Split-Path $PSScriptRoot -Parent
 $version = (Get-Content "$root\VERSION" -Raw).Trim()
 $setup = "$root\dist\ScreenBridge-Setup-$version.exe"
@@ -12,27 +17,30 @@ if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
 $log = Join-Path $env:TEMP 'sb-install.log'
 
 $p = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList @('/VERYSILENT', '/CURRENTUSER', '/SUPPRESSMSGBOXES', '/NORESTART', '/TASKS=autostart', "/DIR=$dir", "/LOG=$log")
-Write-Host "install exit code: $($p.ExitCode)"
+Check "installer exits 0" ($p.ExitCode -eq 0)
 $exe = Join-Path $dir 'screenbridge.exe'
-Write-Host "exe installed:     $(Test-Path $exe)  ($([math]::Round((Get-Item $exe).Length / 1MB, 1)) MB)"
-Write-Host "docs installed:    $(Test-Path (Join-Path $dir 'docs\PROTOCOL.md'))"
+Check "exe installed" (Test-Path $exe)
+Check "docs installed" (Test-Path (Join-Path $dir 'docs\PROTOCOL.md'))
 $run = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name ScreenBridge -ErrorAction SilentlyContinue).ScreenBridge
-Write-Host "autostart entry:   $run"
+Check "autostart entry points at the installed exe" ($run -like "*sb-install-test*screenbridge.exe*")
 $unins = Get-ChildItem $dir -Filter 'unins*.exe' | Select-Object -First 1
-Write-Host "uninstaller:       $($unins.Name)"
+Check "uninstaller present" ($null -ne $unins)
 
 # Start the tray from the installed copy, check it stays up and holds the single-instance mutex.
 $tray = Start-Process -FilePath $exe -PassThru
 Start-Sleep 3
-Write-Host "tray running:      $(-not $tray.HasExited)"
+Check "tray runs" (-not $tray.HasExited)
 $second = Start-Process -FilePath $exe -PassThru
 Start-Sleep 2
-Write-Host "2nd instance exits: $($second.HasExited)"
+Check "second instance exits (single instance)" $second.HasExited
 
 $u = Start-Process -FilePath $unins.FullName -Wait -PassThru -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
 Start-Sleep 2
-Write-Host "uninstall exit:    $($u.ExitCode)"
-Write-Host "exe removed:       $(-not (Test-Path $exe))"
-Write-Host "tray stopped:      $(-not (Get-Process -Id $tray.Id -ErrorAction SilentlyContinue))"
+Check "uninstaller exits 0" ($u.ExitCode -eq 0)
+Check "exe removed" (-not (Test-Path $exe))
+Check "running tray stopped by uninstall" (-not (Get-Process -Id $tray.Id -ErrorAction SilentlyContinue))
 $run2 = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name ScreenBridge -ErrorAction SilentlyContinue).ScreenBridge
-Write-Host "autostart removed: $(-not $run2)"
+Check "autostart entry removed" (-not $run2)
+if ($savedRun) { Set-ItemProperty $runKey -Name ScreenBridge -Value $savedRun }
+Write-Host $(if ($script:failed) { "$script:failed FAILED" } else { "ALL PASSED" })
+exit $script:failed

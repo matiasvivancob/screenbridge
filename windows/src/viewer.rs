@@ -3,8 +3,9 @@
 //! loop on their own threads, so several can run in one process. Wire format: docs/PROTOCOL.md.
 
 use crate::video;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -32,6 +33,8 @@ pub struct Settings {
 pub struct Spec {
     pub id: usize,
     pub port: u16,
+    /// Only datagrams from this address are accepted (the Mac). None accepts any source.
+    pub peer: Option<IpAddr>,
     pub monitor: RECT,
     pub fullscreen: bool,
     pub title: String,
@@ -49,11 +52,12 @@ impl Handle {
     }
 }
 
-/// Window-thread state, stored in GWLP_USERDATA.
+/// Window-thread state, stored in GWLP_USERDATA. Shared references only: SetWindowPos and friends re-enter the
+/// window procedure synchronously, so fields that change use Cell/RefCell and are never borrowed across a Win32 call.
 struct State {
-    fullscreen: bool,
-    saved: (isize, RECT),
-    s: Settings,
+    fullscreen: Cell<bool>,
+    saved: Cell<(isize, RECT)>,
+    s: RefCell<Settings>,
     cmd: mpsc::Sender<Vec<u8>>,
     size: Arc<AtomicU64>, // client size w << 32 | h, read by the render thread
 }
@@ -61,6 +65,11 @@ struct State {
 /// Opens a viewer and returns once its window exists. `closed` gets the spec id when the user closes it.
 /// Fails if the UDP port is taken.
 pub fn open(spec: Spec, closed: mpsc::Sender<usize>) -> std::io::Result<Handle> {
+    static MEDIA_FOUNDATION: std::sync::Once = std::sync::Once::new();
+    MEDIA_FOUNDATION.call_once(|| unsafe {
+        use windows::Win32::Media::MediaFoundation::{MF_VERSION, MFSTARTUP_FULL, MFStartup};
+        _ = MFStartup(MF_VERSION, MFSTARTUP_FULL); // kept for the process lifetime; costs nothing until a viewer exists
+    });
     let sock = UdpSocket::bind(("0.0.0.0", spec.port))?;
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || window_thread(spec, sock, closed, tx));
@@ -116,9 +125,9 @@ fn window_thread(spec: Spec, sock: UdpSocket, closed: mpsc::Sender<usize>, creat
         )
         .unwrap();
         let state = Box::into_raw(Box::new(State {
-            fullscreen: false,
-            saved: (0, RECT::default()),
-            s: spec.settings.clone(),
+            fullscreen: Cell::new(false),
+            saved: Cell::new((0, RECT::default())),
+            s: RefCell::new(spec.settings.clone()),
             cmd: cmd_tx,
             size: size.clone(),
         }));
@@ -127,14 +136,14 @@ fn window_thread(spec: Spec, sock: UdpSocket, closed: mpsc::Sender<usize>, creat
         _ = GetClientRect(hwnd, &mut r);
         size.store((r.right as u64) << 32 | r.bottom as u64, Ordering::Relaxed);
         if spec.fullscreen {
-            set_fullscreen(hwnd, &mut *state, true);
+            set_fullscreen(hwnd, &*state, true);
         }
 
         let stop = Arc::new(AtomicBool::new(false));
         let h = hwnd.0 as isize;
         let render = {
-            let (stop, size, title) = (stop.clone(), size.clone(), spec.title.clone());
-            std::thread::spawn(move || receive(sock, h, title, size, cmd_rx, stop))
+            let (stop, size, title, peer_ip) = (stop.clone(), size.clone(), spec.title.clone(), spec.peer);
+            std::thread::spawn(move || receive(sock, h, title, size, cmd_rx, stop, peer_ip))
         };
         let _ = created.send(h);
 
@@ -163,7 +172,16 @@ fn newer(a: u32, b: u32) -> bool {
 }
 
 /// Network + decode + present loop for one viewer. No queues: each frame is shown as soon as it decodes.
-fn receive(sock: UdpSocket, hwnd: isize, title: String, size: Arc<AtomicU64>, cmds: mpsc::Receiver<Vec<u8>>, stop: Arc<AtomicBool>) {
+/// Largest datagram we accept: our 9-byte header plus a chunk (the sender uses 1200). Bigger is not our protocol.
+const MAX_DATAGRAM: usize = HDR + 1500;
+/// Most chunks one frame may have (~9.8 MB): far above any real keyframe, far below memory exhaustion.
+const MAX_CHUNKS: usize = 8192;
+/// A frame that has not completed this long after its first chunk is abandoned.
+const FRAME_DEADLINE: Duration = Duration::from_millis(100);
+/// If handling one datagram takes longer than this, the socket buffer holds stale video: drop it and resync.
+const STALL: Duration = Duration::from_millis(80);
+
+fn receive(sock: UdpSocket, hwnd: isize, title: String, size: Arc<AtomicU64>, cmds: mpsc::Receiver<Vec<u8>>, stop: Arc<AtomicBool>, peer_ip: Option<IpAddr>) {
     let hwnd = HWND(hwnd as _);
     unsafe { _ = CoInitializeEx(None, COINIT_MULTITHREADED) };
     let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
@@ -172,9 +190,18 @@ fn receive(sock: UdpSocket, hwnd: isize, title: String, size: Arc<AtomicU64>, cm
         ((s >> 32) as u32, s as u32)
     };
     let set_title = |s: &str| unsafe { _ = SetWindowTextW(hwnd, &HSTRING::from(format!("{title} — {s}   [F10 menu · F11 fullscreen]"))) };
-    let mut gpu = match video::Gpu::new(hwnd, monitor, size()) {
-        Ok(g) => g,
-        Err(e) => return set_title(&format!("graphics error: {e}")),
+    // The GPU can be busy or resetting (driver update, sleep); keep trying instead of leaving a dead window.
+    let mut gpu = loop {
+        match video::Gpu::new(hwnd, monitor, size()) {
+            Ok(g) => break g,
+            Err(e) => {
+                set_title(&format!("graphics error: {e}. Retrying…"));
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
     };
     let mut dec: Option<video::Decoder> = None;
     let mut last: Option<video::Picture> = None;
@@ -194,7 +221,7 @@ fn receive(sock: UdpSocket, hwnd: isize, title: String, size: Arc<AtomicU64>, cm
     let mut need_key = true;
     let mut peer: Option<SocketAddr> = None;
     let mut settings: BTreeMap<u8, Vec<u8>> = BTreeMap::new(); // menu choices, replayed if the sender restarts
-    let mut settings_sent_to: Option<SocketAddr> = None;
+    let mut settings_sent: Option<Instant> = None; // settings ride on UDP with no ack, so they are repeated every 2 s
     let mut last_req = Instant::now() - Duration::from_secs(1);
     let (mut frames, mut bytes, mut dec_time, mut stat_t) = (0u32, 0usize, Duration::ZERO, Instant::now());
     let (mut present_time, mut lost) = (Duration::ZERO, 0u32);
@@ -203,8 +230,14 @@ fn receive(sock: UdpSocket, hwnd: isize, title: String, size: Arc<AtomicU64>, cm
     set_title(&status);
 
     while !stop.load(Ordering::Relaxed) {
+        let mut rebuild_gpu = false;
+        let mut worked = Instant::now();
         match sock.recv_from(&mut buf) {
-            Ok((n, from)) if n > HDR => {
+            Ok((n, from)) if n > HDR && n <= MAX_DATAGRAM && peer_ip.is_none_or(|ip| ip == from.ip()) => {
+                worked = Instant::now();
+                if peer != Some(from) {
+                    settings_sent = None; // new sender (or restarted): send our settings right away
+                }
                 peer = Some(from);
                 bytes += n;
                 let id = u32::from_be_bytes(buf[0..4].try_into().unwrap());
@@ -214,7 +247,7 @@ fn receive(sock: UdpSocket, hwnd: isize, title: String, size: Arc<AtomicU64>, cm
                     mac = String::from_utf8_lossy(&buf[HDR..n]).into_owned(); // sender status text
                     continue;
                 }
-                if idx >= count {
+                if idx >= count || count > MAX_CHUNKS {
                     continue;
                 }
                 if let Some(l) = last_done {
@@ -272,7 +305,9 @@ fn receive(sock: UdpSocket, hwnd: isize, title: String, size: Arc<AtomicU64>, cm
                                 dec_time += t.elapsed();
                                 drawn = size();
                                 let t = Instant::now();
-                                let _ = gpu.present(&pic, drawn);
+                                if gpu.present(&pic, drawn).is_err() {
+                                    rebuild_gpu = true; // device removed/reset, or a resize failed
+                                }
                                 present_time += t.elapsed();
                                 last = Some(pic);
                                 frames += 1;
@@ -283,15 +318,39 @@ fn receive(sock: UdpSocket, hwnd: isize, title: String, size: Arc<AtomicU64>, cm
                     }
                 }
             }
-            Ok(_) => {}
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
-                // The last packet of a frame was lost and nothing newer is coming (static screen).
-                if cur.as_ref().is_some_and(|f| f.started.elapsed() > Duration::from_millis(60)) {
-                    cur = None;
+            Ok(_) => {} // wrong size or not from the Mac
+            Err(_) => {} // timeout, or e.g. ICMP-induced WSAECONNRESET after the sender went away
+        }
+        // Checked on every pass, not only when idle: a stream of unrelated packets must not keep a stale frame alive.
+        if cur.as_ref().is_some_and(|f| f.started.elapsed() > FRAME_DEADLINE) {
+            cur = None;
+            need_key = true;
+            lost += 1;
+        }
+        // A stall (GPU hiccup, window drag) leaves seconds of old video in the socket buffer; decoding it all would
+        // show the past. Throw it away and resync on the next keyframe.
+        if worked.elapsed() > STALL {
+            let _ = sock.set_nonblocking(true);
+            while sock.recv_from(&mut buf).is_ok() {}
+            let _ = sock.set_nonblocking(false);
+            cur = None;
+            need_key = true;
+            lost += 1;
+        }
+        if rebuild_gpu {
+            // The decoder holds the old device, so it goes too; the next keyframe brings everything back.
+            match video::Gpu::new(hwnd, monitor, size()) {
+                Ok(g) => {
+                    gpu = g;
+                    dec = None;
+                    last = None;
                     need_key = true;
                 }
+                Err(e) => {
+                    set_title(&format!("graphics error: {e}"));
+                    std::thread::sleep(Duration::from_millis(500));
+                }
             }
-            Err(_) => {} // e.g. ICMP-induced WSAECONNRESET after the sender went away
         }
         // Window resized while the screen is static: redraw the last picture at the new size.
         if size() != drawn {
@@ -306,15 +365,15 @@ fn receive(sock: UdpSocket, hwnd: isize, title: String, size: Arc<AtomicU64>, cm
                 last_req = Instant::now() - Duration::from_secs(1);
             } else {
                 settings.insert(c[0], c);
-                settings_sent_to = None;
+                settings_sent = None;
             }
         }
         if let Some(p) = peer {
-            if settings_sent_to != Some(p) {
+            if settings_sent.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
                 for s in settings.values() {
                     let _ = sock.send_to(s, p);
                 }
-                settings_sent_to = Some(p);
+                settings_sent = Some(Instant::now());
             }
             if need_key && last_req.elapsed() > Duration::from_millis(200) {
                 let _ = sock.send_to(b"K", p);
@@ -345,28 +404,31 @@ fn receive(sock: UdpSocket, hwnd: isize, title: String, size: Arc<AtomicU64>, cm
     }
 }
 
-unsafe fn set_fullscreen(hwnd: HWND, st: &mut State, on: bool) {
+unsafe fn set_fullscreen(hwnd: HWND, st: &State, on: bool) {
     unsafe {
+        // The flag is set first: the Win32 calls below re-enter wndproc and may read it.
+        st.fullscreen.set(on);
         if on {
-            _ = GetWindowRect(hwnd, &mut st.saved.1);
-            st.saved.0 = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            let mut rect = RECT::default();
+            _ = GetWindowRect(hwnd, &mut rect);
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            st.saved.set((style, rect));
             let mut mi = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
             _ = GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi);
             let m = mi.rcMonitor;
-            SetWindowLongPtrW(hwnd, GWL_STYLE, (st.saved.0 & !(WS_OVERLAPPEDWINDOW.0 as isize)) | WS_POPUP.0 as isize);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, (style & !(WS_OVERLAPPEDWINDOW.0 as isize)) | WS_POPUP.0 as isize);
             _ = SetWindowPos(hwnd, Some(HWND_TOP), m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
         } else {
-            SetWindowLongPtrW(hwnd, GWL_STYLE, st.saved.0);
-            let r = st.saved.1;
+            let (style, r) = st.saved.get();
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style);
             _ = SetWindowPos(hwnd, Some(HWND_TOP), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
         }
-        st.fullscreen = on;
     }
 }
 
 /// Native popup menu at the cursor (or the window corner if the cursor is elsewhere).
-unsafe fn show_menu(hwnd: HWND, st: &mut State) {
-    let s = st.s.clone();
+unsafe fn show_menu(hwnd: HWND, st: &State) {
+    let s = st.s.borrow().clone();
     let id = unsafe {
         let item = |m: HMENU, on: bool, id: usize, text: &str| {
             let flags = MF_STRING | if on { MF_CHECKED } else { MF_UNCHECKED };
@@ -396,7 +458,7 @@ unsafe fn show_menu(hwnd: HWND, st: &mut State) {
         item(r, !s.low_latency_rc, 502, "Standard");
         sub(m, r, "Rate control");
         _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
-        item(m, st.fullscreen, 1, "Fullscreen\tF11");
+        item(m, st.fullscreen.get(), 1, "Fullscreen\tF11");
         item(m, false, 2, "Refresh picture");
         _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
         item(m, false, 3, "Close\tAlt+F4");
@@ -415,7 +477,7 @@ unsafe fn show_menu(hwnd: HWND, st: &mut State) {
     };
     let msg = match id {
         1 => {
-            let on = !st.fullscreen;
+            let on = !st.fullscreen.get();
             unsafe { set_fullscreen(hwnd, st, on) };
             None
         }
@@ -425,24 +487,24 @@ unsafe fn show_menu(hwnd: HWND, st: &mut State) {
             None
         }
         101..=199 => {
-            st.s.mbps = id - 100;
-            Some(format!("B{}", st.s.mbps))
+            st.s.borrow_mut().mbps = id - 100;
+            Some(format!("B{}", id - 100))
         }
         201 | 202 => {
-            st.s.hevc = id == 202;
-            Some(if st.s.hevc { "C265" } else { "C264" }.into())
+            st.s.borrow_mut().hevc = id == 202;
+            Some(if id == 202 { "C265" } else { "C264" }.into())
         }
         301 | 302 => {
-            st.s.fps120 = id == 302;
-            Some(if st.s.fps120 { "F120" } else { "F60" }.into())
+            st.s.borrow_mut().fps120 = id == 302;
+            Some(if id == 302 { "F120" } else { "F60" }.into())
         }
         401 | 402 => {
-            st.s.speed = id == 402;
-            Some(if st.s.speed { "S1" } else { "S0" }.into())
+            st.s.borrow_mut().speed = id == 402;
+            Some(if id == 402 { "S1" } else { "S0" }.into())
         }
         501 | 502 => {
-            st.s.low_latency_rc = id == 501;
-            Some(if st.s.low_latency_rc { "L1" } else { "L0" }.into())
+            st.s.borrow_mut().low_latency_rc = id == 501;
+            Some(if id == 501 { "L1" } else { "L0" }.into())
         }
         _ => None,
     };
@@ -457,7 +519,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         if st.is_null() {
             return DefWindowProcW(hwnd, msg, wp, lp); // messages sent during CreateWindowExW
         }
-        let st = &mut *st;
+        let st = &*st;
         match msg {
             WM_SIZE => {
                 let (w, h) = (lp.0 as u64 & 0xffff, (lp.0 as u64 >> 16) & 0xffff);
@@ -466,7 +528,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             WM_ERASEBKGND => LRESULT(1),
             WM_KEYDOWN if wp.0 == VK_F11.0 as usize => {
-                let on = !st.fullscreen;
+                let on = !st.fullscreen.get();
                 set_fullscreen(hwnd, st, on);
                 LRESULT(0)
             }

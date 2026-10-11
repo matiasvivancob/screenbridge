@@ -1,15 +1,25 @@
-// Network side of the menu-bar app: announces this Mac, accepts one PC session at a time and
-// creates/removes virtual displays on request. Protocol: docs/PROTOCOL.md.
+// Network side of the menu-bar app: announces this Mac, accepts one linked PC at a time and creates/removes
+// virtual displays on request. A link stays up while no display is on; displays toggle individually.
+// Protocol: docs/PROTOCOL.md.
 
 import AppKit
 import Foundation
 
 let controlPort: UInt16 = 47800
 let discoveryPort: UInt16 = 47801
+let maxDisplays = 8
+
+/// One display the linked PC offers, as listed in its `layout` message.
+struct LayoutDisplay {
+    let id: Int
+    let name: String
+    let width: Int
+    let height: Int
+}
 
 final class Agent {
     /// Main-queue callbacks for the UI.
-    var onStatus: ((String, Bool) -> Void)? // text, active
+    var onStatus: ((String, Bool) -> Void)? // text, any display on
     var approve: ((_ pcName: String, _ done: @escaping (Bool) -> Void) -> Void)?
 
     let name = Host.current().localizedName ?? "Mac"
@@ -20,9 +30,20 @@ final class Agent {
         Thread.detachNewThread { self.serve() }
     }
 
-    /// Disconnects the current PC (menu "Stop").
+    /// Disconnects the linked PC (menu "Disconnect"). The PC will not reconnect by itself.
     func stop() {
-        session?.end(reason: "Stopped from the Mac")
+        session?.end(reason: "Disconnected from the Mac", tellPC: true)
+    }
+
+    /// The linked PC, its offered displays and which of them are on. Main queue only.
+    var linkInfo: (pc: String, displays: [LayoutDisplay], on: Set<Int>)? {
+        guard let s = session, s.welcomed, !s.ended else { return nil }
+        return (s.pcName, s.layout, Set(s.screens.keys))
+    }
+
+    /// Asks the PC to turn one of its displays on or off (the PC owns the viewer windows).
+    func toggle(id: Int, on: Bool) {
+        session?.send(["type": "toggle", "id": id, "on": on])
     }
 
     // MARK: approvals (UserDefaults: pc_id -> pc name)
@@ -88,15 +109,26 @@ final class Agent {
                 $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { accept(fd, $0, &len) }
             }
             if c < 0 { continue }
+            // A peer that stops reading must not be able to block us (or kill us with SIGPIPE).
+            var one: Int32 = 1
+            setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+            var tv = timeval(tv_sec: 2, tv_usec: 0)
+            setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
             var ip = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
             inet_ntop(AF_INET, &peer.sin_addr, &ip, socklen_t(INET_ADDRSTRLEN))
             let s = Session(fd: c, ip: String(cString: ip), agent: self)
-            DispatchQueue.main.async {
-                self.session?.end(reason: "Another PC connected")
-                self.session = s
+            // A new connection never evicts the active PC. It becomes active only once it is approved (welcome()).
+            DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+                if !s.welcomed && !s.awaitingApproval { s.end(reason: "Dropped a connection that never said hello", tellPC: false) }
             }
             Thread.detachNewThread { s.read() }
         }
+    }
+
+    /// `s` has been approved: it replaces the previously active PC, if any.
+    fileprivate func activate(_ s: Session) {
+        if let old = session, old !== s { old.end(reason: "Another PC connected", tellPC: false) }
+        session = s
     }
 
     fileprivate func ended(_ s: Session, reason: String) {
@@ -104,6 +136,12 @@ final class Agent {
             session = nil
             onStatus?(reason, false)
         }
+    }
+
+    /// Forgets a PC and disconnects it right away if it is the one linked now.
+    func revoke(id: String) {
+        allowed.removeValue(forKey: id)
+        if let s = session, s.pcID == id { s.end(reason: "Removed \(s.pcName)", tellPC: true) }
     }
 }
 
@@ -117,8 +155,11 @@ final class Session {
     let ip: String
     unowned let agent: Agent
     var pcName = "PC"
+    var pcID = ""
     var welcomed = false
+    var awaitingApproval = false
     var screens: [Int: Screen] = [:]
+    var layout: [LayoutDisplay] = []
     var lastPing = Date()
     var watchdog: Timer?
     var ended = false
@@ -154,7 +195,7 @@ final class Session {
             }
             if buf.count > 1 << 20 { break } // a line this long is not our protocol
         }
-        DispatchQueue.main.async { self.end(reason: "\(self.pcName) disconnected") }
+        DispatchQueue.main.async { self.end(reason: "\(self.pcName) disconnected", tellPC: false) }
     }
 
     func handle(_ m: [String: Any]) {
@@ -163,12 +204,14 @@ final class Session {
         switch m["type"] as? String {
         case "hello":
             let id = m["pc_id"] as? String ?? ""
+            pcID = id
             pcName = (m["pc_name"] as? String).map { String($0.prefix(64)) } ?? "PC"
-            guard id.count >= 16 else { send(["type": "denied"]); return end(reason: "Rejected a PC without an id") }
+            guard id.count >= 16 else { send(["type": "denied"]); return end(reason: "Rejected a PC without an id", tellPC: false) }
             if agent.allowed[id] != nil {
                 welcome()
             } else {
                 send(["type": "pending"])
+                awaitingApproval = true
                 agent.onStatus?("Waiting for you to allow \(pcName)…", false)
                 agent.approve?(pcName) { ok in
                     guard !self.ended else { return }
@@ -177,33 +220,45 @@ final class Session {
                         self.welcome()
                     } else {
                         self.send(["type": "denied"])
-                        self.end(reason: "Denied \(self.pcName)")
+                        self.end(reason: "Denied \(self.pcName)", tellPC: false)
                     }
                 }
             }
-        case "extend" where welcomed:
-            extend(m)
+        case "layout" where welcomed:
+            layout = (m["displays"] as? [[String: Any]] ?? []).prefix(maxDisplays).compactMap { d in
+                guard let id = d["id"] as? Int, (0..<maxDisplays).contains(id),
+                      let w = d["width"] as? Int, let h = d["height"] as? Int else { return nil }
+                let name = (d["name"] as? String).map { String($0.prefix(40)) } ?? "Display \(id + 1)"
+                return LayoutDisplay(id: id, name: name, width: w, height: h)
+            }
+        case "add" where welcomed:
+            add(m)
         case "remove" where welcomed:
             if let id = m["id"] as? Int, let s = screens.removeValue(forKey: id) { s.stop() }
-            if screens.isEmpty { end(reason: "\(pcName) closed its viewers") } else { status() }
+            changed()
+        case "ping" where welcomed:
+            send(["type": "pong"]) // lets the PC detect a Mac that vanished without closing the connection
         case "stop":
-            end(reason: "\(pcName) stopped")
+            end(reason: "\(pcName) disconnected", tellPC: false)
         default:
             break // ping, or unknown messages from newer versions
         }
     }
 
     func welcome() {
+        guard !welcomed else { return }
         welcomed = true
+        agent.activate(self)
         send(["type": "welcome", "name": agent.name])
-        agent.onStatus?("Connected to \(pcName)", false)
+        status()
         watchdog = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             guard let self else { return }
-            if Date().timeIntervalSince(self.lastPing) > 6 { self.end(reason: "Lost contact with \(self.pcName)") }
+            if Date().timeIntervalSince(self.lastPing) > 6 { self.end(reason: "Lost contact with \(self.pcName)", tellPC: false) }
         }
     }
 
-    func extend(_ m: [String: Any]) {
+    /// Turns one display on. The PC has already opened its viewer and is listening on `port`.
+    func add(_ m: [String: Any]) {
         guard CGPreflightScreenCaptureAccess() else {
             CGRequestScreenCaptureAccess()
             send(["type": "error", "message": "Screen Recording permission is missing on the Mac. Allow ScreenBridge in System Settings > Privacy & Security > Screen Recording, then quit and reopen ScreenBridge."])
@@ -217,31 +272,44 @@ final class Session {
         enc.speed = st["speed"] as? Bool ?? false
         enc.lowLatencyRC = st["low_latency_rc"] as? Bool ?? true
 
-        for s in screens.values { s.stop() }
-        screens = [:]
-        for d in (m["displays"] as? [[String: Any]] ?? []).prefix(8) {
-            guard let id = d["id"] as? Int, let w = d["width"] as? Int, let h = d["height"] as? Int, let port = d["port"] as? Int,
-                  (640...7680).contains(w), (480...4320).contains(h), (1024...65535).contains(port),
-                  let link = Link(host: ip, port: UInt16(port)) else { continue }
-            let s = Screen(index: screens.count, w: w & ~1, h: h & ~1, link: link, settings: enc)
-            s.onError = { [weak self] msg in
-                self?.send(["type": "error", "message": msg])
-                self?.end(reason: msg)
-            }
-            screens[id] = s
-            s.start()
+        guard let d = m["display"] as? [String: Any],
+              let id = d["id"] as? Int, (0..<maxDisplays).contains(id),
+              let w = d["width"] as? Int, let h = d["height"] as? Int, let port = d["port"] as? Int,
+              (640...7680).contains(w), (480...7680).contains(h), (1024...65535).contains(port),
+              let link = Link(host: ip, port: UInt16(port)) else {
+            send(["type": "error", "message": "The Mac couldn't use that display request."])
+            return
         }
-        send(["type": "extended", "count": screens.count])
+        if let old = screens.removeValue(forKey: id) { old.stop() }
+        // The slot number is the display's identity (vendor/product/serial), so macOS remembers its arrangement.
+        let s = Screen(index: id, w: w & ~1, h: h & ~1, link: link, settings: enc)
+        s.onError = { [weak self] msg in
+            guard let self, self.screens[id] === s else { return }
+            self.screens.removeValue(forKey: id)?.stop()
+            self.send(["type": "error", "message": msg])
+            self.changed()
+        }
+        screens[id] = s
+        s.start()
+        changed()
+    }
+
+    /// Tells the PC which displays are on and refreshes the Mac's status.
+    func changed() {
+        send(["type": "state", "on": screens.keys.sorted()])
         status()
     }
 
     func status() {
-        agent.onStatus?("Extending to \(pcName): \(screens.count) display\(screens.count == 1 ? "" : "s")", !screens.isEmpty)
+        let n = screens.count
+        let text = "Linked with \(pcName) · " + (n == 0 ? "no displays on" : "\(n) display\(n == 1 ? "" : "s") on")
+        agent.onStatus?(text, n > 0)
     }
 
-    func end(reason: String) {
+    func end(reason: String, tellPC: Bool) {
         guard !ended else { return }
         ended = true
+        if tellPC { send(["type": "bye"]) } // tells the PC not to reconnect on its own
         watchdog?.invalidate()
         for s in screens.values { s.stop() }
         screens = [:] // releasing the Screens removes the virtual displays

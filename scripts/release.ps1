@@ -9,19 +9,23 @@ $root = Split-Path $PSScriptRoot -Parent
 $version = (Get-Content "$root\VERSION" -Raw).Trim()
 $dist = "$root\dist"
 
+# Start from an empty artifact set so a failed step can never publish a stale file from an earlier build.
+New-Item -ItemType Directory $dist -Force | Out-Null
+Get-ChildItem $dist -File | Where-Object { $_.Name -match '^(ScreenBridge-|SHA256SUMS)' } | Remove-Item -Force
+
 & "$PSScriptRoot\build-windows.ps1"
 
 $macHost = $env:SB_MAC_HOST
 if ($macHost) {
     Write-Host "Building the Mac app on $macHost..."
     $remote = '~/screenbridge-build'
-    ssh $macHost "rm -rf $remote && mkdir -p $remote/assets"
-    scp -q -r "$root\mac" "${macHost}:$remote/"
-    scp -q "$root\VERSION" "${macHost}:$remote/"
-    scp -q "$root\assets\icon.png" "${macHost}:$remote/assets/"
-    ssh $macHost "cd $remote && rm -rf mac/build && sh mac/build.sh"
-    if ($LASTEXITCODE) { throw "Mac build failed" }
-    scp -q "${macHost}:$remote/mac/build/ScreenBridge-$version.dmg" "${macHost}:$remote/mac/build/ScreenBridge-$version-mac.zip" "$dist\"
+    function Run($what, [scriptblock]$cmd) { & $cmd; if ($LASTEXITCODE) { throw "$what failed (exit $LASTEXITCODE)" } }
+    Run "prepare Mac folder" { ssh $macHost "rm -rf $remote && mkdir -p $remote/assets" }
+    Run "copy sources" { scp -q -r "$root\mac" "${macHost}:$remote/" }
+    Run "copy VERSION" { scp -q "$root\VERSION" "${macHost}:$remote/" }
+    Run "copy icon" { scp -q "$root\assets\icon.png" "${macHost}:$remote/assets/" }
+    Run "Mac build" { ssh $macHost "cd $remote && rm -rf mac/build && sh mac/build.sh" }
+    Run "copy dmg and zip back" { scp -q "${macHost}:$remote/mac/build/ScreenBridge-$version.dmg" "${macHost}:$remote/mac/build/ScreenBridge-$version-mac.zip" "$dist\" }
 } else {
     Write-Host "SB_MAC_HOST not set: skipping the Mac build (run 'sh mac/build.sh' on a Mac)."
 }

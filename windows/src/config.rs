@@ -19,6 +19,8 @@ pub struct Config {
     pub mac_name: String,
     /// Manual "host" or "host:port", used instead of discovery when set (other subnets, VPNs).
     pub mac_address: String,
+    /// Link to the Mac in the background as soon as ScreenBridge starts (no displays are turned on by this).
+    pub auto_connect: bool,
     pub displays: Vec<DisplayCfg>,
     pub codec: Codec,
     pub mbps: u32,
@@ -37,6 +39,8 @@ pub struct DisplayCfg {
     /// Windows monitor device name (e.g. `\\.\DISPLAY1`) the viewer opens on.
     pub monitor: String,
     pub fullscreen: bool,
+    /// Turn this display on whenever the link to the Mac comes up.
+    pub auto_on: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,10 +56,11 @@ impl Default for Config {
             pc_id: random_id(),
             mac_name: String::new(),
             mac_address: String::new(),
+            auto_connect: true,
             // One virtual display per PC monitor, at that monitor's resolution.
             displays: monitors()
                 .into_iter()
-                .map(|m| DisplayCfg { enabled: true, width: m.width(), height: m.height(), monitor: m.device, fullscreen: true })
+                .map(|m| DisplayCfg { enabled: true, width: m.width(), height: m.height(), monitor: m.device, fullscreen: true, auto_on: false })
                 .collect(),
             codec: Codec::H264,
             mbps: 30,
@@ -68,7 +73,7 @@ impl Default for Config {
 
 impl Default for DisplayCfg {
     fn default() -> Self {
-        DisplayCfg { enabled: true, width: 1920, height: 1080, monitor: String::new(), fullscreen: true }
+        DisplayCfg { enabled: true, width: 1920, height: 1080, monitor: String::new(), fullscreen: true, auto_on: false }
     }
 }
 
@@ -88,7 +93,8 @@ impl Config {
     /// Loads the config, creating (and saving) defaults on first run.
     pub fn load() -> Config {
         let path = dir().join("config.json");
-        match std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str::<Config>(&s).ok()) {
+        // trim_start_matches: a UTF-8 BOM (older Notepad, some scripts) must not make us discard the user's settings.
+        match std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str::<Config>(s.trim_start_matches('\u{feff}')).ok()) {
             Some(mut c) => {
                 if c.pc_id.is_empty() {
                     c.pc_id = random_id();

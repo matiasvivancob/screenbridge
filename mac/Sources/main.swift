@@ -45,8 +45,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let head = NSMenuItem(title: status, action: nil, keyEquivalent: "")
         head.isEnabled = false
         menu.addItem(head)
-        if status.hasPrefix("Extending") {
-            menu.addItem(withTitle: "Stop Extending", action: #selector(stopSession), keyEquivalent: "").target = self
+        // One toggle per display the linked PC offers. The PC opens/closes its viewer window.
+        if let link = agent.linkInfo {
+            menu.addItem(.separator())
+            if link.displays.isEmpty {
+                let none = NSMenuItem(title: "No displays configured on \(link.pc)", action: nil, keyEquivalent: "")
+                none.isEnabled = false
+                menu.addItem(none)
+            }
+            for d in link.displays {
+                let i = NSMenuItem(title: "\(d.name) · \(d.width)×\(d.height)", action: #selector(toggleDisplay(_:)), keyEquivalent: "")
+                i.target = self
+                i.representedObject = d.id
+                i.state = link.on.contains(d.id) ? .on : .off
+                menu.addItem(i)
+            }
+            menu.addItem(.separator())
+            menu.addItem(withTitle: "Disconnect from \(link.pc)", action: #selector(stopSession), keyEquivalent: "").target = self
         }
         if !CGPreflightScreenCaptureAccess() {
             menu.addItem(withTitle: "Grant Screen Recording Permission…", action: #selector(openPrivacy), keyEquivalent: "").target = self
@@ -84,9 +99,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func stopSession() { agent.stop() }
 
+    @objc func toggleDisplay(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? Int else { return }
+        agent.toggle(id: id, on: sender.state != .on)
+    }
+
     @objc func revoke(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
-        agent.allowed.removeValue(forKey: id)
+        agent.revoke(id: id)
     }
 
     @objc func toggleLogin() {

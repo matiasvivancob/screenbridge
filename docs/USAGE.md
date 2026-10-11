@@ -1,19 +1,28 @@
 # Using ScreenBridge
 
+## Background link and per-display toggles
+
+ScreenBridge keeps one tiny connection to the Mac in the background (about 2.5 MB of private memory, nothing on the GPU,
+no windows). **Nothing is extended until you turn a display on.** Each display toggles on its own, from either computer,
+and the link survives toggling, the Mac sleeping and waking, and short network drops (displays that were on come back).
+
 ## The tray icon (PC)
 
 | Action | Result |
 |---|---|
-| Double-click | Extend, or stop if already extending |
-| Right-click / click | Menu: status, **Extend displays / Stop extending**, **Settings…**, **Start with Windows**, **Quit** |
+| Double-click | All displays on, or all off if any is on (not connected: connect) |
+| Right-click / click | Menu: status, one checkable item per display, **Turn all displays on/off**, **Connect/Disconnect**, **Settings…**, **Start with Windows**, **Quit** |
 | Hover | Current status |
 
-A balloon appears when you need to act (click Allow on the Mac) or when extending fails, with the reason.
+A balloon appears only when you need to act (click Allow on the Mac) or something failed, with the reason.
+Closing a viewer window (Alt+F4) turns that display off; the link stays up.
 
 ## The menu-bar icon (Mac)
 
-Status line, **Stop Extending**, **Allowed PCs** (remove a PC to make it ask again), **Open at Login**, **Quit**.
-The icon shows two displays while a PC is connected.
+Status line, one checkable item per display the PC offers (click to turn it on/off; the PC opens or closes its window),
+**Disconnect from <PC>** (the PC stays disconnected until you connect it again), **Allowed PCs** (remove one to make it ask
+again; removing the PC that is linked disconnects it), **Open at Login**, **Quit**.
+The icon shows two displays while any display is on.
 
 ## In a viewer window
 
@@ -32,15 +41,17 @@ The title bar shows live numbers, for example `60 fps · Mac encode 12.8 ms (max
 
 | Setting | Notes |
 |---|---|
+| **Connect in the background** | Link to the Mac as soon as ScreenBridge starts. Off = connect from the tray menu when you want. |
 | **Mac** | *Automatic* picks the first Mac found. Choose a specific one if you have several. *Manual address* is for a Mac that can't be discovered (another subnet, VPN): `192.168.1.104` or `host:47800`. |
-| **Displays** | One row per virtual display: on/off, size, which PC monitor shows it, start fullscreen. Up to 4. *Match monitor* sets the size to that monitor's native resolution, which gives the sharpest text. |
+| **Displays** | One row per virtual display: enabled (offered in the menus), size, which PC monitor shows it, start fullscreen, **On at connect** (turns on by itself whenever the link comes up). Up to 4. *Match monitor* sets the size to that monitor's native resolution, which gives the sharpest text. |
 | **Codec** | H.264 works everywhere. HEVC gives better quality per Mbps but needs the HEVC Video Extensions on the PC. |
 | **Bitrate** | 20–40 Mbps is plenty on wired gigabit for a 1440p desktop. |
 | **Frame rate** | 60 is right for most monitors. 120 halves the capture wait and looks smoother on a 120/144 Hz monitor, at more GPU cost on the Mac. |
 | **Prioritize encoding speed** | Trades some quality for lower encode time. |
 | **Apple low-latency rate control** | Leave on unless a particular Mac encodes slowly with it. |
 
-Saved settings apply the next time you extend. The F10 menu changes the running session immediately but isn't saved.
+Saved settings are picked up within a couple of seconds: a display that is on is rebuilt if its size or monitor changed;
+codec, bitrate and frame rate apply to the next display you turn on. The F10 menu changes a running display immediately but isn't saved.
 
 ## Sharing the mouse and keyboard
 

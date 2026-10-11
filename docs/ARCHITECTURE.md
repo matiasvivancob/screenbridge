@@ -24,7 +24,7 @@ queues in between: a frame is shown as soon as it is decoded.
 | File | Role |
 |---|---|
 | `main.swift` | `NSApplication` accessory app: status item, menu, approval alert, login item |
-| `Agent.swift` | UDP announcements; TCP control server; `Session` per connected PC (approval, extend/remove, watchdog) |
+| `Agent.swift` | UDP announcements; TCP control server; `Session` per connected PC (approval, add/remove, watchdog); only an approved session becomes the active one |
 | `Screen.swift` | One virtual display: create, capture, encode, packetize; applies the viewer's live settings |
 | `CGVirtualDisplay.h` | Declarations of the private CoreGraphics classes, imported through the bridging header |
 
@@ -44,7 +44,7 @@ Decisions worth knowing:
 |---|---|
 | `main.rs` | Entry: tray (default), `--settings`, `--view PORT N` |
 | `tray.rs` | Notification-area icon, menu, autostart, single instance, Explorer-restart recovery |
-| `session.rs` | Mac discovery; one session = connect, hello, extend, ping, close; opens a `viewer` per display |
+| `session.rs` | Mac discovery; the link thread: connect, hello, layout, per-display add/remove, ping/pong, reconnect and restore |
 | `viewer.rs` | Window + render thread per display: reassembly, decode, present, F10/F11 handling, back-channel settings |
 | `video.rs` | Media Foundation decoder wrapper and D3D11 video-processor/swapchain presenter |
 | `settings.rs` | egui settings window (separate process, so the tray never loads a GUI toolkit) |
@@ -55,6 +55,8 @@ Decisions worth knowing:
 - **GPU all the way.** The decoder outputs D3D11 textures; the video processor converts and scales them straight into the
   swapchain's back buffer. The CPU only touches compressed bytes.
 - **The device is created on the adapter that drives the monitor**, so frames never cross GPUs.
+- **One long-lived link, short-lived viewers.** Windows, the D3D device and the decoder exist only while a display is on;
+  the idle cost is a socket and a 2-second ping.
 - **Settings is a separate process** (`screenbridge.exe --settings`): the tray stays tiny and a UI crash can't stop a session.
 - **Late/damaged frames are dropped, not waited for**: any gap marks the stream "needs keyframe" and requests one.
 - **PC → Mac settings are replayed** whenever the sender's address changes, so a restarted Mac picks up the viewer's choices.

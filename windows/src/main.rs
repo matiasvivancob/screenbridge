@@ -12,7 +12,6 @@ mod tray;
 mod video;
 mod viewer;
 
-use windows::Win32::Media::MediaFoundation::{MF_VERSION, MFSTARTUP_FULL, MFStartup};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 
 fn main() {
@@ -24,7 +23,6 @@ fn main() {
     unsafe {
         // Physical pixels everywhere, so a 2560x1440 stream maps 1:1 onto a 2560x1440 monitor at any scaling.
         _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        MFStartup(MF_VERSION, MFSTARTUP_FULL).expect("Media Foundation");
     }
     if let Some(i) = args.iter().position(|a| a == "--view") {
         // Built without a console window; borrow the one we were started from so SB_VERBOSE statistics print.
@@ -40,7 +38,7 @@ fn main() {
             speed: cfg.speed,
             low_latency_rc: cfg.low_latency_rc,
         };
-        let spec = viewer::Spec { id: 0, port, monitor: m.rect, fullscreen: !args.iter().any(|a| a == "--windowed"), title: format!("ScreenBridge :{port}"), settings };
+        let spec = viewer::Spec { id: 0, port, peer: None, monitor: m.rect, fullscreen: !args.iter().any(|a| a == "--windowed"), title: format!("ScreenBridge :{port}"), settings };
         let (tx, rx) = std::sync::mpsc::channel();
         let _h = viewer::open(spec, tx).expect("UDP port in use");
         let _ = rx.recv();

@@ -1,7 +1,9 @@
-//! Notification-area app: Extend/Stop, Settings, Start with Windows, Quit. Double-click the icon to toggle.
+//! Notification-area app. It keeps one lightweight link to the Mac in the background; the menu turns each display
+//! on or off. Double-click the icon: all displays on (or all off if any is on).
 
-use crate::session::{self, Command, Macs, Status};
-use std::sync::{Arc, Mutex, mpsc};
+use crate::session::{self, Command, LinkState, Macs, Shared, Status};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::*;
@@ -14,11 +16,17 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_STATUS: u32 = WM_APP + 2;
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 
+const ID_ALL: usize = 1;
+const ID_SETTINGS: usize = 2;
+const ID_AUTOSTART: usize = 3;
+const ID_QUIT: usize = 4;
+const ID_LINK: usize = 5;
+const ID_DISPLAY_BASE: usize = 100;
+
 struct App {
-    hwnd: isize,
-    macs: Macs,
-    status: Status,
-    session: Option<(mpsc::Sender<Command>, std::thread::JoinHandle<()>)>,
+    state: Shared,
+    link: Sender<Command>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 static APP: Mutex<Option<App>> = Mutex::new(None);
@@ -33,13 +41,24 @@ pub fn run() {
         let inst = GetModuleHandleW(None).unwrap();
         let wc = WNDCLASSW { lpfnWndProc: Some(wndproc), hInstance: inst.into(), lpszClassName: w!("ScreenBridgeTray"), ..Default::default() };
         RegisterClassW(&wc);
-        let hwnd = CreateWindowExW(WINDOW_EX_STYLE(0), w!("ScreenBridgeTray"), w!("ScreenBridge"), WINDOW_STYLE(0), 0, 0, 0, 0, Some(HWND_MESSAGE), None, Some(inst.into()), None).unwrap();
+        // A hidden top-level window, not message-only: only top-level windows receive the TaskbarCreated broadcast
+        // that tells us Explorer restarted and the icon must be added again.
+        let hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, w!("ScreenBridgeTray"), w!("ScreenBridge"), WS_POPUP, 0, 0, 0, 0, None, None, Some(inst.into()), None).unwrap();
+        add_icon(hwnd);
 
         let macs: Macs = Arc::new(Mutex::new(Vec::new()));
         let m = macs.clone();
         std::thread::spawn(move || session::discover(m));
-        *APP.lock().unwrap() = Some(App { hwnd: hwnd.0 as isize, macs, status: Status::Idle, session: None });
-        add_icon(hwnd);
+
+        let state = session::new_state();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (s, h) = (state.clone(), hwnd.0 as isize);
+        let thread = std::thread::spawn(move || {
+            session::run(macs, rx, s, move || {
+                _ = PostMessageW(Some(HWND(h as _)), WM_STATUS, WPARAM(0), LPARAM(0));
+            })
+        });
+        *APP.lock().unwrap() = Some(App { state, link: tx, thread: Some(thread) });
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -72,71 +91,71 @@ unsafe fn add_icon(hwnd: HWND) {
     }
 }
 
-fn status_text(s: &Status) -> String {
-    match s {
-        Status::Idle => "Not extending".into(),
-        Status::Connecting => "Connecting…".into(),
+fn status_text(s: &LinkState) -> String {
+    let on = s.displays.iter().filter(|d| d.on).count();
+    match &s.status {
+        Status::Off => "Not connected to a Mac".into(),
+        Status::Searching => "Looking for the Mac…".into(),
         Status::WaitingForApproval(mac) => format!("Click Allow on {mac}"),
-        Status::Extending(mac, n) => format!("Extending {mac} · {n} display{}", if *n == 1 { "" } else { "s" }),
-        Status::Failed(e) => e.clone(),
+        Status::Linked(mac) if on == 0 => format!("Connected to {mac} · no displays on"),
+        Status::Linked(mac) => format!("Connected to {mac} · {on} display{} on", if on == 1 { "" } else { "s" }),
+        Status::Retrying(why) => format!("{why}. Trying again…"),
     }
 }
 
-/// Called from the session thread.
-fn report(s: Status) {
-    let hwnd = {
-        let mut g = APP.lock().unwrap();
-        let app = g.as_mut().unwrap();
-        app.status = s;
-        app.hwnd
-    };
-    unsafe { _ = PostMessageW(Some(HWND(hwnd as _)), WM_STATUS, WPARAM(0), LPARAM(0)) };
-}
-
+/// Link thread -> tray: new tooltip, and a balloon if the user needs to know something.
 unsafe fn on_status(hwnd: HWND) {
-    let status = APP.lock().unwrap().as_ref().unwrap().status.clone();
+    let (text, balloon) = {
+        let g = APP.lock().unwrap();
+        let mut s = g.as_ref().unwrap().state.lock().unwrap();
+        (status_text(&s), s.balloon.take())
+    };
     let mut d = icon_data(hwnd);
     d.uFlags = NIF_TIP;
-    copy(&mut d.szTip, &format!("ScreenBridge: {}", status_text(&status)));
-    // Balloons only for things the user must act on.
-    let balloon = match &status {
-        Status::WaitingForApproval(_) => Some(("Approve on the Mac", NIIF_INFO)),
-        Status::Failed(_) => Some(("ScreenBridge couldn't extend", NIIF_WARNING)),
-        _ => None,
-    };
-    if let Some((title, flags)) = balloon {
+    copy(&mut d.szTip, &format!("ScreenBridge: {text}"));
+    if let Some((title, body)) = balloon {
         d.uFlags |= NIF_INFO;
-        d.dwInfoFlags = flags;
-        copy(&mut d.szInfoTitle, title);
-        copy(&mut d.szInfo, &status_text(&status));
+        d.dwInfoFlags = NIIF_INFO;
+        copy(&mut d.szInfoTitle, &title);
+        copy(&mut d.szInfo, &body);
     }
     unsafe { _ = Shell_NotifyIconW(NIM_MODIFY, &d) };
 }
 
-fn extending() -> bool {
-    APP.lock().unwrap().as_ref().unwrap().session.as_ref().is_some_and(|(_, h)| !h.is_finished())
-}
-
-fn toggle() {
-    let mut g = APP.lock().unwrap();
-    let app = g.as_mut().unwrap();
-    if let Some((tx, h)) = app.session.take() {
-        if !h.is_finished() {
-            let _ = tx.send(Command::Stop);
-            return;
-        }
+fn send(c: Command) {
+    if let Some(app) = APP.lock().unwrap().as_ref() {
+        let _ = app.link.send(c);
     }
-    let (tx, rx) = mpsc::channel();
-    let macs = app.macs.clone();
-    let h = std::thread::spawn(move || session::run(macs, rx, report));
-    app.session = Some((tx, h));
 }
 
-fn stop_and_wait() {
-    let s = APP.lock().unwrap().as_mut().unwrap().session.take();
-    if let Some((tx, h)) = s {
-        let _ = tx.send(Command::Stop);
-        let _ = h.join(); // closes the viewers and tells the Mac to remove its displays
+fn snapshot() -> LinkState {
+    APP.lock().unwrap().as_ref().unwrap().state.lock().unwrap().clone()
+}
+
+fn linked(s: &LinkState) -> bool {
+    matches!(s.status, Status::Linked(_))
+}
+
+/// Double-click: everything on, or everything off when anything is on. Not connected: connect.
+fn quick_toggle() {
+    let s = snapshot();
+    if linked(&s) {
+        send(Command::SetAll(!s.displays.iter().any(|d| d.on)));
+    } else {
+        send(Command::Connect);
+    }
+}
+
+/// Stops the link thread (closing viewers and telling the Mac) before the process goes away.
+fn shutdown() {
+    let t = {
+        let mut g = APP.lock().unwrap();
+        let app = g.as_mut().unwrap();
+        let _ = app.link.send(Command::Quit);
+        app.thread.take()
+    };
+    if let Some(t) = t {
+        let _ = t.join();
     }
 }
 
@@ -164,29 +183,52 @@ fn open_settings() {
 
 unsafe fn show_menu(hwnd: HWND) {
     unsafe {
-        let status = status_text(&APP.lock().unwrap().as_ref().unwrap().status);
-        let busy = extending();
+        let s = snapshot();
         let m = CreatePopupMenu().unwrap();
-        _ = AppendMenuW(m, MF_STRING | MF_GRAYED, 0, &HSTRING::from(status));
+        _ = AppendMenuW(m, MF_STRING | MF_GRAYED, 0, &HSTRING::from(status_text(&s)));
         _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
-        _ = AppendMenuW(m, MF_STRING, 1, if busy { w!("Stop extending") } else { w!("Extend displays") });
-        _ = SetMenuDefaultItem(m, 1, 0); // bold: what a double-click does
-        _ = AppendMenuW(m, MF_STRING, 2, w!("Settings…"));
+
+        if linked(&s) {
+            if s.displays.is_empty() {
+                _ = AppendMenuW(m, MF_STRING | MF_GRAYED, 0, &HSTRING::from("No displays configured (open Settings)"));
+            }
+            for d in &s.displays {
+                let flags = MF_STRING | if d.on { MF_CHECKED } else { MF_UNCHECKED };
+                _ = AppendMenuW(m, flags, ID_DISPLAY_BASE + d.id, &HSTRING::from(&d.label));
+            }
+            if !s.displays.is_empty() {
+                let any_on = s.displays.iter().any(|d| d.on);
+                _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+                _ = AppendMenuW(m, MF_STRING, ID_ALL, &HSTRING::from(if any_on { "Turn all displays off" } else { "Turn all displays on" }));
+                _ = SetMenuDefaultItem(m, ID_ALL as u32, 0); // bold: what a double-click does
+            }
+            _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+        }
+        let connected = !matches!(s.status, Status::Off);
+        _ = AppendMenuW(m, MF_STRING, ID_LINK, &HSTRING::from(if connected { "Disconnect from the Mac" } else { "Connect to the Mac" }));
         _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
-        _ = AppendMenuW(m, MF_STRING | if autostart() { MF_CHECKED } else { MF_UNCHECKED }, 3, w!("Start with Windows"));
-        _ = AppendMenuW(m, MF_STRING, 4, w!("Quit ScreenBridge"));
+        _ = AppendMenuW(m, MF_STRING, ID_SETTINGS, w!("Settings…"));
+        _ = AppendMenuW(m, MF_STRING | if autostart() { MF_CHECKED } else { MF_UNCHECKED }, ID_AUTOSTART, w!("Start with Windows"));
+        _ = AppendMenuW(m, MF_STRING, ID_QUIT, w!("Quit ScreenBridge"));
+
         let mut p = POINT::default();
         _ = GetCursorPos(&mut p);
         _ = SetForegroundWindow(hwnd); // so the menu closes when clicking elsewhere
-        let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, p.x, p.y, None, hwnd, None).0;
+        let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, p.x, p.y, None, hwnd, None).0 as usize;
         _ = DestroyMenu(m);
         match id {
-            1 => toggle(),
-            2 => open_settings(),
-            3 => set_autostart(!autostart()),
-            4 => {
-                stop_and_wait();
+            0 => {}
+            ID_ALL => send(Command::SetAll(!s.displays.iter().any(|d| d.on))),
+            ID_SETTINGS => open_settings(),
+            ID_AUTOSTART => set_autostart(!autostart()),
+            ID_LINK => send(if connected { Command::Disconnect } else { Command::Connect }),
+            ID_QUIT => {
+                shutdown();
                 PostQuitMessage(0);
+            }
+            id if id >= ID_DISPLAY_BASE => {
+                let want = s.displays.iter().find(|d| d.id == id - ID_DISPLAY_BASE).map(|d| !d.on).unwrap_or(true);
+                send(Command::Toggle(id - ID_DISPLAY_BASE, want));
             }
             _ => {}
         }
@@ -200,7 +242,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         match msg {
             WM_TRAY => {
                 match lp.0 as u32 {
-                    WM_LBUTTONDBLCLK => toggle(),
+                    WM_LBUTTONDBLCLK => quick_toggle(),
                     WM_RBUTTONUP | WM_LBUTTONUP => show_menu(hwnd),
                     _ => {}
                 }
@@ -211,7 +253,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 LRESULT(0)
             }
             WM_ENDSESSION => {
-                stop_and_wait(); // Windows shutting down: remove the Mac's displays cleanly
+                shutdown(); // Windows shutting down: remove the Mac's displays cleanly
                 LRESULT(0)
             }
             m if m == taskbar_created => {

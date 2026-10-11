@@ -1,5 +1,7 @@
 # Unzips dist\ScreenBridge-<version>-portable.zip to a temp folder, runs it, and checks that settings stay inside that folder.
 $ErrorActionPreference = 'Stop'
+$script:failed = 0
+function Check($name, $ok) { if (-not $ok) { $script:failed++ }; Write-Host ("{0}  {1}" -f $(if ($ok) { 'PASS' } else { 'FAIL' }), $name) }
 $root = Split-Path $PSScriptRoot -Parent
 $version = (Get-Content "$root\VERSION" -Raw).Trim()
 $zip = "$root\dist\ScreenBridge-$version-portable.zip"
@@ -10,7 +12,7 @@ if ($dir -notlike '*\sb-portable-test') { throw "unexpected dir $dir" }
 if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
 Expand-Archive $zip $dir
 $app = Join-Path $dir 'ScreenBridge'
-Write-Host "zip contents:      $((Get-ChildItem $app | ForEach-Object Name) -join ', ')"
+Check "zip has exe, portable.txt and README" ((Test-Path "$app\screenbridge.exe") -and (Test-Path "$app\portable.txt") -and (Test-Path "$app\README.md"))
 
 $appdata = "$env:APPDATA\ScreenBridge\config.json"
 $before = if (Test-Path $appdata) { (Get-Item $appdata).LastWriteTimeUtc } else { $null }
@@ -19,15 +21,17 @@ $before = if (Test-Path $appdata) { (Get-Item $appdata).LastWriteTimeUtc } else 
 $p = Start-Process "$app\screenbridge.exe" -ArgumentList '--settings' -PassThru
 $deadline = (Get-Date).AddSeconds(30)
 while ((Get-Date) -lt $deadline -and -not (Test-Path "$app\data\config.json") -and -not $p.HasExited) { Start-Sleep -Milliseconds 300 }
-Write-Host "settings window:   $(if ($p.HasExited) { 'exited' } else { 'running' })"
+Check "settings window starts" (-not $p.HasExited)
 if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force; $p.WaitForExit(5000) | Out-Null }
 
-Write-Host "data\config.json:  $(Test-Path "$app\data\config.json")"
+Check "settings written to data\config.json" (Test-Path "$app\data\config.json")
 $after = if (Test-Path $appdata) { (Get-Item $appdata).LastWriteTimeUtc } else { $null }
-Write-Host "%APPDATA% config untouched: $($before -eq $after)"
+Check "%APPDATA% config untouched" ($before -eq $after)
 $id = (Get-Content "$app\data\config.json" -Raw | ConvertFrom-Json).pc_id
-Write-Host "own pc_id:         $($id.Substring(0, 8))... (separate from the installed copy's id)"
+Check "portable copy has its own pc_id" ($id.Length -ge 16)
 
 Start-Sleep 1
 Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
-Write-Host "cleaned up: $(-not (Test-Path $dir))"
+Check "cleaned up" (-not (Test-Path $dir))
+Write-Host $(if ($script:failed) { "$script:failed FAILED" } else { "ALL PASSED" })
+exit $script:failed
